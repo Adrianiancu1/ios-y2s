@@ -33079,7 +33079,7 @@ index 3ad743f..322c995 100644
  #else
  void
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index d0db827..6a6accb 100644
+index d0db827..20be117 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
 @@ -26,6 +26,7 @@
@@ -33115,6 +33115,8 @@ index d0db827..6a6accb 100644
 +
 +static volatile uint32_t *fbcon_base;
 +static uint64_t fbcon_map_size;
++static uint32_t fbcon_width, fbcon_height, fbcon_stride;
++static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
 +void y2s_fbcon_info(uint64_t *base, uint64_t *size, uint32_t *geo);
 +void
 +y2s_fbcon_info(uint64_t *base, uint64_t *size, uint32_t *geo)
@@ -33124,8 +33126,6 @@ index d0db827..6a6accb 100644
 +	geo[0] = fbcon_width; geo[1] = fbcon_height; geo[2] = fbcon_stride;
 +	geo[3] = fbcon_row; geo[4] = fbcon_rows;
 +}
-+static uint32_t fbcon_width, fbcon_height, fbcon_stride;
-+static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
 +
 +static void
 +fbcon_clear_row(uint32_t row)
