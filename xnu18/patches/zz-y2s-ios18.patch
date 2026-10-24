@@ -31534,6 +31534,22 @@ index 8d2cad3..8fac384 100644
  void
  cpu_timebase_init(boolean_t from_boot)
  {
+diff --git a/osfmk/arm64/kpc.c b/osfmk/arm64/kpc.c
+index 3dcbcb3..78f5e0f 100644
+--- a/osfmk/arm64/kpc.c
++++ b/osfmk/arm64/kpc.c
+@@ -1149,4 +1149,11 @@ kpc_get_rawpmu_config(__unused kpc_config_t *configv)
+ 	return 0;
+ }
+ 
++
++/* Y2S and other non-Apple cores: monotonic_arm64.c still dispatches PMIs here. */
++void
++kpc_pmi_handler(unsigned int ctr __unused)
++{
++}
++
+ #endif /* !APPLE_ARM64_ARCH_FAMILY */
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 index cbb494a..e156495 100644
 --- a/osfmk/arm64/machine_routines.c
