@@ -84,7 +84,34 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee ../build.log
+
+      - name: Report patches and compile errors as annotations
+        if: always()
+        run: |
+          # Run logs are not downloadable from the agent side; annotations are.
+          python3 - <<'PY'
+          import re
+          log = open('build.log', errors='replace').read().splitlines()
+          def emit(title, lines):
+              for i in range(0, len(lines), 40):
+                  chunk = '%0A'.join(l.replace('%', '%25')[:300] for l in lines[i:i + 40])
+                  print(f'::error title={title} {i // 40}::{chunk}')
+          emit('patches', [l for l in log if 'Applying patch' in l or 'Skipping patch' in l][:40])
+          errs, seen = [], set()
+          for l in log:
+              m = re.search(r'(\S+?):(\d+):\d+: (fatal )?error: (.*)', l)
+              if m:
+                  key = (m.group(1).split('/xnu/')[-1], m.group(4))
+                  if key not in seen:
+                      seen.add(key)
+                      errs.append(f'{key[0]}:{m.group(2)}: {key[1]}')
+          errs += [l for l in log if re.search(r'Undefined symbols|ld: |make.*Error', l)][:20]
+          emit('errors', errs[:360])
+          print('unique errors:', len(seen))
+          PY
 
       - name: Package build tree for local compiles
         if: always()
