@@ -103,7 +103,7 @@ jobs:
                   if key not in seen:
                       seen.add(key)
                       errs.append(f'{key[0]}:{m.group(2)}: {key[1]}')
-          errs += [l for l in log if re.search(r'Undefined symbols|ld: error|^\s+"_|make.*Error|\*\*\* ', l)][:60]
+          errs += [l for l in log if re.search(r'Undefined symbols|symbol\(s\) not found|^ld: (?!warning)|referenced from|^\s+"?_[A-Za-z0-9_$.]+"?,? *$|duplicate symbol|make.*Error|\*\*\* ', l)][:300]
           emit('errors', errs[:360])
           emit('scripts', [l for l in log if re.search(r'Running script|Staged |requires xnu|refusing|fatal:|SystemExit|source changed', l)][:40])
           tail = [l for l in log if 'built for newer' not in l][-80:]
