@@ -1,0 +1,404 @@
+diff --git a/bsd/dev/y2s_ufs.c b/bsd/dev/y2s_ufs.c
+index a39c01e..42c3a5e 100644
+--- a/bsd/dev/y2s_ufs.c
++++ b/bsd/dev/y2s_ufs.c
+@@ -14,6 +14,15 @@
+  * a 1 MiB bounce buffer); the host is not cache coherent, so caches are
+  * cleaned/invalidated around each command.
+  *
++ * Galaxy S20+ (Exynos 990, ADT /y2s-ufs compatible "samsung,exynos-ufs"):
++ * the same UFSHCI programming model as Samsung's ufs-exynos.c (SM-G986B
++ * kernel): PRDT and response offsets/lengths in bytes
++ * (UFSHCD_QUIRK_PRDT_BYTE_GRAN), 128-byte PRDT entries after the EL3 call
++ * FMP_SECURITY(DESCTYPE_3) + SMU_INIT that Linux makes at every boot, size
++ * word bits 28-31 = 0 (FMP bypass, plain data), and a request-list clear
++ * that takes the slot bit itself (UFSHCI_QUIRK_BROKEN_REQ_LIST_CLR). The
++ * Qualcomm-only input drivers below are not started there.
++ *
+  * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
+  * against the partition bounds again right before it is issued, so nothing
+  * outside the named partition can be written.
+@@ -64,6 +73,7 @@ extern void y2s_usb_probe(void);
+ #define REG_UTRLDBR     0x58
+ #define REG_UTRLCLR     0x5c
+ #define REG_UTRLRSR     0x60
++#define REG_AHIT        0x18                    /* auto-hibernate idle timer (UFSHCI 3.0) */
+ 
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+@@ -72,7 +82,8 @@ extern void y2s_usb_probe(void);
+ #define UFS_BLOCK       4096u
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+-#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
++#define PRDT_CHUNK_EXYNOS (4u << 10)            /* HCI_TXPRDT_ENTRY_SIZE 12: 2^12 per entry */
++#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK_EXYNOS)
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+ #define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+ #define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
+@@ -84,22 +95,42 @@ struct utrd {
+ 	uint32_t prdt;          /* [31:16] PRDT offset (DWORDs), [15:0] entries */
+ };
+ 
++/* PRDT entry: 16 bytes on standard UFSHCI, 128 on Exynos (FMP descriptor type 3). */
++struct prd {
++	uint32_t addr_lo, addr_hi, rsvd, dbc;
++};
++#define PRD_SIZE_STD    16u
++#define PRD_SIZE_EXYNOS 128u
++
+ struct ucd {
+ 	uint8_t cmd[512];
+ 	uint8_t resp[512];
+-	struct {
+-		uint32_t addr_lo, addr_hi, rsvd, dbc;
+-	} prdt[PRDT_MAX];
++	uint8_t prdt[PRDT_MAX * PRD_SIZE_EXYNOS];
+ };
+ 
++/* Exynos vendor HCI registers (ufs-exynos.h) */
++#define VS_TXPRDT_ENTRY_SIZE    0x00
++#define VS_RXPRDT_ENTRY_SIZE    0x04
++#define VS_PRDT_PREFETCH_EN     (1u << 31)
++#define VS_PRDT_SET_SIZE(x)     ((x) & 0x1f)
++/* EL3 calls (include/linux/smc.h, drivers/crypto/fmp/fmp.c) */
++#define SMC_CMD_FMP_SECURITY    0xC2001810u
++#define SMC_CMD_SMU             0xC2001850u
++#define FMP_CFG_DESCTYPE_3      3u
++#define SMU_INIT                0u
++
+ /* Layout of the contiguous DMA allocation. */
+ #define DMA_UTRL        0x0000                  /* 1 KiB aligned */
+ #define DMA_UCD         0x1000                  /* 128 byte aligned */
+-#define DMA_BOUNCE      0x4000
++#define DMA_BOUNCE      0x10000                 /* UCD with 256 x 128-byte PRDT entries before */
+ #define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
++_Static_assert(DMA_UCD + sizeof(struct ucd) <= DMA_BOUNCE, "UCD overlaps the bounce buffer");
+ 
+ static struct {
+ 	vm_offset_t regs;
++	vm_offset_t vs_regs;                    /* Exynos vendor HCI block, 0 otherwise */
++	bool exynos;
++	uint32_t prd_size;                      /* PRDT entry size in bytes */
+ 	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+ 	uint64_t dma_pa;
+ 	uint8_t lun;
+@@ -112,8 +143,15 @@ static struct {
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
++	uint8_t target_lun;                     /* LUN of the next command (su.lun or a W-LUN) */
++	uint8_t sense_key, asc, ascq;           /* of the last CHECK CONDITION */
++	uint32_t last_is;                       /* IS at the last completion */
++	bool last_rang;                         /* doorbell bit seen set after ringing */
++	bool last_unprocessed;                  /* host never touched the last command */
+ } su;
+ 
++#define UFS_WLUN_DEVICE         0xd0            /* UFS Device well-known LU */
++
+ static LCK_GRP_DECLARE(y2s_ufs_grp, "y2s_ufs");
+ static LCK_MTX_DECLARE(y2s_ufs_lock, &y2s_ufs_grp);
+ 
+@@ -145,8 +183,18 @@ dma_clean(uint32_t off, uint32_t len)
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+  */
++static int ufs_take_over_host(void);
++
++/* Bytes of PRDT a transfer of len bytes uses. */
++static uint32_t
++n_prdt_bytes(uint32_t len)
++{
++	uint32_t step = su.exynos ? PRDT_CHUNK_EXYNOS : PRDT_CHUNK;
++	return ((len + step - 1) / step) * su.prd_size;
++}
++
+ static int
+-ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+@@ -158,7 +206,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 
+ 	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
+ 	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
+-	ucd->cmd[2] = su.lun;
++	ucd->cmd[2] = su.target_lun;
+ 	ucd->cmd[3] = ++su.tag;
+ 	ucd->cmd[12] = (uint8_t)(len >> 24);
+ 	ucd->cmd[13] = (uint8_t)(len >> 16);
+@@ -171,16 +219,23 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
+ 	utrd->ucdba = (uint32_t)ucd_pa;
+ 	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+-	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	utrd->resp = su.exynos ? (512u << 16 | 512u) : ((512u / 4) << 16 | (512u / 4));
+ 	if (len) {
+ 		uint32_t n = 0;
+-		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
+-			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
+-			ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
+-			ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
+-			ucd->prdt[n].dbc = chunk - 1;
++		uint32_t step = su.exynos ? PRDT_CHUNK_EXYNOS : PRDT_CHUNK;
++		for (uint32_t done = 0; done < len; done += step, n++) {
++			uint32_t chunk = MIN(step, len - done);
++			struct prd *prd = (struct prd *)(void *)&ucd->prdt[n * su.prd_size];
++			prd->addr_lo = (uint32_t)(bounce_pa + done);
++			prd->addr_hi = (uint32_t)((bounce_pa + done) >> 32);
++			/* Bits 28-31 stay 0: FMP file/disk encryption bypassed. */
++			prd->dbc = chunk - 1;
+ 		}
+ 		utrd->prdt = (1024u / 4) << 16 | n;
++		if (su.exynos) {
++			/* Offsets and lengths in bytes, not DWORDs. */
++			utrd->prdt = 1024u << 16 | (n * su.prd_size);
++		}
+ 	}
+ 
+ 	if (su.cache) {
+@@ -189,7 +244,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+ 		if (len) {
+ 			dma_clean(DMA_UCD + offsetof(struct ucd, prdt),
+-			    (utrd->prdt & 0xffff) * sizeof(ucd->prdt[0]));
++			    n_prdt_bytes(len));
+ 		}
+ 	} else {
+ 		dma_sync(DMA_UTRL, sizeof(*utrd));
+@@ -205,6 +260,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	__builtin_arm_dsb(0xf);
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
++	su.last_rang = (ufs_rd(REG_UTRLDBR) & 1) != 0;
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+ 	deadline += mach_absolute_time();
+@@ -219,7 +275,8 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
++			/* Exynos: the clear register takes the slot bit, not its inverse. */
++			ufs_wr(REG_UTRLCLR, su.exynos ? 1u : ~1u);
+ 			printf("Y2S UFS: command 0x%02x timed out\n", cdb[0]);
+ 			return ETIMEDOUT;
+ 		}
+@@ -235,7 +292,8 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		}
+ 	}
+ 	__builtin_arm_dsb(0xf);
+-	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
++	su.last_is = ufs_rd(REG_IS);
++	ufs_wr(REG_IS, su.last_is);             /* acknowledge completion status */
+ 
+ 	dma_sync(DMA_UTRL, sizeof(*utrd));
+ 	if (su.cache) {
+@@ -248,6 +306,20 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	}
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
++	su.sense_key = su.asc = su.ascq = 0;
++	su.last_unprocessed = (ocs == 0x0f && ucd->resp[0] == 0);
++	if (ucd->resp[0] == 0x21 && ucd->resp[7] == 0x02) {
++		/* CHECK CONDITION: fixed-format sense data after the 2-byte length at 32. */
++		uint16_t slen = (uint16_t)(ucd->resp[32] << 8 | ucd->resp[33]);
++		if (slen >= 14) {
++			su.sense_key = ucd->resp[34 + 2] & 0x0f;
++			su.asc = ucd->resp[34 + 12];
++			su.ascq = ucd->resp[34 + 13];
++		}
++		printf("Y2S UFS: LUN 0x%x command 0x%02x: CHECK CONDITION sense %x/%02x/%02x (ocs 0x%x)\n",
++		    su.target_lun, cdb[0], su.sense_key, su.asc, su.ascq, ocs);
++		return EIO;
++	}
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		printf("Y2S UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+@@ -256,6 +328,28 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	return 0;
+ }
+ 
++/*
++ * ufs_scsi_once, and if the host never processed the command (descriptor and
++ * response untouched), report the host state and restart the request list
++ * once, then retry.
++ */
++static int
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	int error = ufs_scsi_once(cdb, cdb_len, len, write);
++	if (!error || !su.last_unprocessed) {
++		return error;
++	}
++	printf("Y2S UFS: unprocessed: rang %d IS 0x%x HCS 0x%x HCE 0x%x RSR 0x%x DBR 0x%x AHIT 0x%x LBA 0x%x\n",
++	    su.last_rang, su.last_is, ufs_rd(REG_HCS), ufs_rd(REG_HCE), ufs_rd(REG_UTRLRSR),
++	    ufs_rd(REG_UTRLDBR), ufs_rd(REG_AHIT), ufs_rd(REG_UTRLBA));
++	if (ufs_take_over_host() == 0) {
++		error = ufs_scsi_once(cdb, cdb_len, len, write);
++		printf("Y2S UFS: request list restarted, retry: %d\n", error);
++	}
++	return error;
++}
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -353,6 +447,96 @@ ufs_find_partition(const char *want)
+ 	return ENOENT;
+ }
+ 
++static uint64_t
++ufs_smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "memory");
++	return x0;
++}
++
++/*
++ * Exynos: the descriptor format Linux uses (ufs-exynos.c exynos_ufs_init_host
++ * and exynos_fmp_sec_cfg). The host itself is not reset: S-Boot left the
++ * link up after loading boot.img from it.
++ */
++static int
++ufs_exynos_setup(void)
++{
++	uint64_t fmp = ufs_smc(SMC_CMD_FMP_SECURITY, 0, 0 /* fmp-id */, FMP_CFG_DESCTYPE_3);
++	uint64_t smu = ufs_smc(SMC_CMD_SMU, SMU_INIT, 0 /* smu-id */, 0);
++	/* Keep the link out of auto-hibernate while idle (we poll, no H8 handling). */
++	uint32_t ahit = ufs_rd(REG_AHIT);
++	if (ahit) {
++		ufs_wr(REG_AHIT, 0);
++	}
++	printf("Y2S UFS: AHIT was 0x%x, now 0x%x; HCS 0x%x\n", ahit, ufs_rd(REG_AHIT), ufs_rd(REG_HCS));
++	uint32_t tx = *(volatile uint32_t *)(su.vs_regs + VS_TXPRDT_ENTRY_SIZE);
++	uint32_t rx = *(volatile uint32_t *)(su.vs_regs + VS_RXPRDT_ENTRY_SIZE);
++	*(volatile uint32_t *)(su.vs_regs + VS_TXPRDT_ENTRY_SIZE) = VS_PRDT_PREFETCH_EN | VS_PRDT_SET_SIZE(12);
++	*(volatile uint32_t *)(su.vs_regs + VS_RXPRDT_ENTRY_SIZE) = VS_PRDT_SET_SIZE(12);
++	__builtin_arm_dsb(0xf);
++	printf("Y2S UFS: Exynos host: FMP_SECURITY %lld, SMU_INIT %lld, PRDT size tx 0x%x rx 0x%x (were 0x%x 0x%x)\n",
++	    (long long)fmp, (long long)smu,
++	    *(volatile uint32_t *)(su.vs_regs + VS_TXPRDT_ENTRY_SIZE),
++	    *(volatile uint32_t *)(su.vs_regs + VS_RXPRDT_ENTRY_SIZE), tx, rx);
++	if (fmp != 0 || smu != 0) {
++		return EIO;
++	}
++	return 0;
++}
++
++/*
++ * Get LUN 0 to answer TEST UNIT READY. A pending unit attention (sense key 6)
++ * is consumed by reporting it, so just retry. NOT READY (key 2), e.g. when
++ * the bootloader left the device in a low-power mode, needs START STOP UNIT
++ * (power condition ACTIVE) to the UFS Device W-LUN, as Linux sends at boot
++ * (ufshcd_set_dev_pwr_mode); the W-LUN may itself report a unit attention
++ * first, which REQUEST SENSE clears.
++ */
++static int
++ufs_wake_device(void)
++{
++	static const uint8_t tur[6] = { 0x00 };
++	static const uint8_t request_sense[6] = { 0x03, 0, 0, 0, 18, 0 };
++	static const uint8_t ssu_active[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++	int error = EIO;
++
++	for (int i = 0; i < 8; i++) {
++		su.target_lun = su.lun;
++		error = ufs_scsi(tur, sizeof(tur), 0, false);
++		if (!error) {
++			if (i) {
++				printf("Y2S UFS: LUN %u ready after %d tries\n", su.lun, i + 1);
++			}
++			return 0;
++		}
++		if (su.sense_key == 0x6) {
++			continue;               /* unit attention: reported now, cleared */
++		}
++		if (su.sense_key != 0x2) {
++			return error;
++		}
++		/* NOT READY: wake the device through the UFS Device W-LUN. */
++		su.target_lun = UFS_WLUN_DEVICE;
++		(void)ufs_scsi(request_sense, sizeof(request_sense), 18, false);
++		int ssu = ufs_scsi(ssu_active, sizeof(ssu_active), 0, false);
++		if (ssu) {
++			(void)ufs_scsi(request_sense, sizeof(request_sense), 18, false);
++			ssu = ufs_scsi(ssu_active, sizeof(ssu_active), 0, false);
++		}
++		printf("Y2S UFS: START STOP UNIT (active) to W-LUN 0x%x: %d\n", UFS_WLUN_DEVICE, ssu);
++		su.target_lun = su.lun;
++		delay(20000);                   /* 20 ms */
++	}
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -598,6 +782,20 @@ y2s_ufs_init(void)
+ 		printf("Y2S UFS: no /y2s-ufs node in the device tree\n");
+ 		return ENXIO;
+ 	}
++	char const *compat = NULL;
++	unsigned int compat_size = 0;
++	su.exynos = SecureDTGetProperty(node, "compatible", (void const **)&compat, &compat_size) == kSuccess &&
++	    compat_size >= sizeof("samsung,exynos-ufs") &&
++	    strncmp(compat, "samsung,exynos-ufs", sizeof("samsung,exynos-ufs")) == 0;
++	su.prd_size = su.exynos ? PRD_SIZE_EXYNOS : PRD_SIZE_STD;
++	if (su.exynos) {
++		/* reg = <HCI base, size, vendor HCI base, size> */
++		if (size < 4 * sizeof(uintptr_t)) {
++			printf("Y2S UFS: Exynos node needs the vendor HCI region\n");
++			return ENXIO;
++		}
++		su.vs_regs = ml_io_map(reg[2], reg[3]);
++	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+@@ -619,15 +817,16 @@ y2s_ufs_init(void)
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+ 	su.lun = 0;
++	su.target_lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&y2s_ufs_lock);
+-	error = ufs_take_over_host();
++	error = su.exynos ? ufs_exynos_setup() : 0;
+ 	if (!error) {
+-		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+-		}
++		error = ufs_take_over_host();
++	}
++	if (!error) {
++		error = ufs_wake_device();
+ 	}
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+@@ -656,10 +855,12 @@ y2s_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	y2s_log_start();
+ 	y2s_sample_start();
+-	/* Input drivers (HID services in iokit/Kernel/arm/hid/Y2SHID.cpp). */
+-	y2s_keys_init();
+-	y2s_touch_init();
+-	y2s_usb_probe();
++	/* Input drivers (HID services in iokit/Kernel/arm/hid/Y2SHID.cpp): Qualcomm only. */
++	if (!su.exynos) {
++		y2s_keys_init();
++		y2s_touch_init();
++		y2s_usb_probe();
++	}
+ 	return 0;
+ }
+ 

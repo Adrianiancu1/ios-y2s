@@ -1,0 +1,20 @@
+diff --git a/iokit/Kernel/arm/Y2SCPU.cpp b/iokit/Kernel/arm/Y2SCPU.cpp
+index 9bc2d41..88e1025 100644
+--- a/iokit/Kernel/arm/Y2SCPU.cpp
++++ b/iokit/Kernel/arm/Y2SCPU.cpp
+@@ -74,8 +74,13 @@ Y2SCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	/*
++	 * Galaxy S20+ (Exynos 990, live DT): MPIDR Aff1:Aff0 0x000-0x003 A55,
++	 * 0x004-0x005 A76 (one DynamIQ cluster), 0x100-0x101 M5. Accept Aff1 0-1
++	 * and Aff0 0-15 (the GICv3 SGI target-list limit; GICv2 uses the CPU
++	 * interface mask instead).
++	 */
++	if ((cpu->phys_id & ~0x10fu) != 0 ||
+ 	    topology->num_cpus > Y2S_SMP_MAX_CPUS) {
+ 		panic("Y2S CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);

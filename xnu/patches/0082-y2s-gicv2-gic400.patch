@@ -1,0 +1,417 @@
+diff --git a/iokit/Kernel/arm/Y2SCPU.cpp b/iokit/Kernel/arm/Y2SCPU.cpp
+index 2545cf9..dc2e591 100644
+--- a/iokit/Kernel/arm/Y2SCPU.cpp
++++ b/iokit/Kernel/arm/Y2SCPU.cpp
+@@ -20,6 +20,7 @@
+ 
+ extern "C" void y2s_secondary_entry(void);
+ extern "C" boolean_t y2s_cpu_signal_is_enabled(unsigned int cpu);
++extern "C" void y2s_gic_send_ipi(unsigned int cpu, uint64_t target_mpidr);
+ 
+ class Y2SCPU;
+ static Y2SCPU *y2s_cpus[MAX_CPUS];
+@@ -214,19 +215,8 @@ Y2SCPU::signalCPU(IOCPU *target)
+ 	if (logical >= topology->num_cpus) {
+ 		panic("Y2S CPU: invalid SGI target %u", logical);
+ 	}
+-	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+-	uint64_t mpidr = topology->cpus[logical].phys_id;
+-	unsigned int aff0 = mpidr & 0xff;
+-	if (aff0 >= 16) {
+-		panic("Y2S CPU: SGI target requires unsupported range selector");
+-	}
+-	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
+-	    (((mpidr >> 16) & 0xff) << 32) |
+-	    (((mpidr >> 8) & 0xff) << 16) |
+-	    ((uint64_t)Y2S_IPI_SGI << 24) | (1ULL << aff0);
+-	__builtin_arm_dsb(DSB_ISHST);
+-	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+-	__builtin_arm_isb(ISB_SY);
++	/* GICv3: ICC_SGI1R_EL1 by target MPIDR; GICv2: GICD_SGIR by CPU interface. */
++	y2s_gic_send_ipi(logical, topology->cpus[logical].phys_id);
+ }
+ 
+ kern_return_t
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..b9bfe8b 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1861,8 +1861,8 @@ sleh_irq(arm_saved_state_t *state)
+ 	 * y2s: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
+-	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+-	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++	uint32_t intid;
++	uint32_t iar = y2s_gic_ack(&intid);
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+@@ -1873,11 +1873,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		y2s_gic_eoi(iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		y2s_gic_eoi(iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
+@@ -1888,7 +1888,7 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		y2s_gic_eoi(iar);
+ 	}
+ 	__builtin_arm_isb(ISB_SY);
+ #else
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..60f24f1 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -306,11 +306,17 @@ LEXT(y2s_secondary_entry)
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
+-	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
++	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access,
++	 * only if the core has a GICv3 CPU interface (ID_AA64PFR0_EL1.GIC != 0).
++	 * With a GIC-400 (GICv2) it is disabled and ICC_* accesses are UNDEFINED. */
++	mrs		x1, ID_AA64PFR0_EL1
++	ubfx	x1, x1, #24, #4
++	cbz		x1, Ly2s_secondary_no_icc
+ 	mrs		x1, ICC_SRE_EL2
+ 	orr		x1, x1, #1
+ 	orr		x1, x1, #8
+ 	msr		ICC_SRE_EL2, x1
++Ly2s_secondary_no_icc:
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..c167753 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -20,6 +20,17 @@ MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS,
+ #if defined(Y2S)
+ /* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
+ SECURITY_READ_ONLY_LATE(uint32_t) y2s_vtimer_intid = Y2S_VTIMER_INTID;
++
++/*
++ * GICv2 (GIC-400, e.g. Exynos 990) instead of GICv3. Chosen once on the boot
++ * CPU from /arm-io/gic "compatible". In this mode no ICC_* system register is
++ * ever touched: the CPU interface is the memory-mapped GICC, and the second
++ * "reg" pair of the GIC node is GICC instead of GICR.
++ */
++SECURITY_READ_ONLY_LATE(boolean_t) y2s_gic_v2 = FALSE;
++static vm_offset_t gicc_base;
++/* GICv2 CPU interface mask (GICD_ITARGETSR byte) per logical CPU, for SGIs. */
++static uint8_t y2s_gicv2_cpu_mask[GICV2_MAX_CPU_IF];
+ #endif
+ 
+ static vm_offset_t gicd_base;
+@@ -49,6 +60,195 @@ _gic_write32(vm_offset_t addr, uint32_t value)
+ #define gicr_read32(offset) (_gic_read32(gicr_pe_base + (offset)))
+ #define gicr_write32(offset, data) (_gic_write32(gicr_pe_base + (offset), (data)))
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
++#if defined(Y2S)
++#define gicc_read32(offset) (_gic_read32(gicc_base + (offset)))
++#define gicc_write32(offset, data) (_gic_write32(gicc_base + (offset), (data)))
++
++/* Exact match of one entry of a NUL-separated "compatible" list. */
++static boolean_t
++y2s_compat_entry_is(const char *s, unsigned int len, const char *want)
++{
++	unsigned int i = 0;
++	for (; i < len && want[i] != '\0'; i++) {
++		if (s[i] != want[i]) {
++			return FALSE;
++		}
++	}
++	return i == len && want[i] == '\0';
++}
++
++static boolean_t
++y2s_gic_compatible_is_v2(DTEntry entry)
++{
++	void const *prop;
++	unsigned int size;
++	if (SecureDTGetProperty(entry, "compatible", &prop, &size) != kSuccess) {
++		return FALSE;
++	}
++	const char *list = (const char *)prop;
++	unsigned int start = 0;
++	while (start < size) {
++		unsigned int len = 0;
++		while (start + len < size && list[start + len] != '\0') {
++			len++;
++		}
++		const char *s = list + start;
++		if (y2s_compat_entry_is(s, len, "arm,gic-400") ||
++		    y2s_compat_entry_is(s, len, "arm,cortex-a15-gic") ||
++		    y2s_compat_entry_is(s, len, "arm,gic-v2")) {
++			return TRUE;
++		}
++		start += len + 1;
++	}
++	return FALSE;
++}
++
++/* Same mask Linux uses: this CPU's bit in the banked GICD_ITARGETSR0-7. */
++static uint8_t
++y2s_gicv2_local_cpu_mask(void)
++{
++	for (unsigned int i = 0; i < 32; i += 4) {
++		uint32_t mask = gicd_read32(GICD_ITARGETSR + i);
++		mask |= mask >> 16;
++		mask |= mask >> 8;
++		if (mask & 0xff) {
++			return (uint8_t)(mask & 0xff);
++		}
++	}
++	return 0;
++}
++
++static void
++y2s_gicv2_init_cpu(void)
++{
++	unsigned int cpu = (unsigned int)ml_get_cpu_number_local();
++	if (cpu >= GICV2_MAX_CPU_IF) {
++		panic("%s: logical CPU %u has no GICv2 CPU interface (max %u)",
++		    __func__, cpu, GICV2_MAX_CPU_IF);
++	}
++	uint8_t mask = y2s_gicv2_local_cpu_mask();
++	if (mask == 0) {
++		/*
++		 * GICv2 spec: in a uniprocessor implementation GICD_ITARGETSRn
++		 * are RAZ/WI (QEMU virt with -smp 1 does this). Only then is
++		 * CPU interface 0 the one and only target.
++		 */
++		uint32_t typer = gicd_read32(GICD_TYPER);
++		if (((typer >> GICD_TYPER_CPUNUMBER_SHIFT) & 0x7) != 0) {
++			panic("%s: GICD_ITARGETSR0-7 read 0 on CPU %u (GICD_TYPER 0x%x)",
++			    __func__, cpu, typer);
++		}
++		mask = 0x01;
++	}
++	__atomic_store_n(&y2s_gicv2_cpu_mask[cpu], mask, __ATOMIC_RELEASE);
++
++	/*
++	 * SGIs and PPIs are banked per CPU in the distributor. From the
++	 * non-secure side GICD_IGROUPR is RAZ/WI and Group 0 bits of the enable
++	 * and priority registers are WI: firmware must already have put these
++	 * in Group 1, which is what Linux on the same firmware relies on.
++	 * Priorities written here are the non-secure view.
++	 */
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicd_write32(GICD_IPRIORITYR + i, 0xA0A0A0A0);
++	}
++	gicd_write32(GICD_ISENABLER, (1U << y2s_vtimer_intid) | (1U << Y2S_IPI_SGI));
++
++	/* Accept everything above the lowest priority, no preemption groups. */
++	gicc_write32(GICC_PMR, 0xF0);
++	gicc_write32(GICC_BPR, 0);
++
++	/*
++	 * Distributor Group 1 forwarding (the NS alias of GICD_CTLR has only
++	 * this bit). Never clear anything: other CPUs and the secure side
++	 * share the distributor. Unlike Linux's gic_dist_init we do not reset
++	 * SPI configuration either.
++	 */
++	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
++	if (!(gicd_ctlr & GICD_CTLR_ENABLEGRP1)) {
++		gicd_write32(GICD_CTLR, gicd_ctlr | GICD_CTLR_ENABLEGRP1);
++	}
++
++	/*
++	 * CPU interface: keep the bypass-disable bits as firmware left them
++	 * (like Linux gic_cpu_if_up), EOImodeNS=0 so one GICC_EOIR write both
++	 * drops priority and deactivates, Group 1 signalled as IRQ.
++	 */
++	uint32_t gicc_ctlr = gicc_read32(GICC_CTLR);
++	gicc_ctlr &= GICC_CTLR_BYPASS_MASK;
++	gicc_ctlr |= GICC_CTLR_ENABLEGRP1;
++	gicc_write32(GICC_CTLR, gicc_ctlr);
++	__builtin_arm_dsb(DSB_SY);
++	__builtin_arm_isb(ISB_SY);
++
++	kprintf("Y2S GICv2: cpu %u if-mask 0x%02x GICD_CTLR 0x%x GICC_CTLR 0x%x\n",
++	    cpu, mask, gicd_read32(GICD_CTLR), gicc_read32(GICC_CTLR));
++}
++
++/*
++ * Interrupt acknowledge/EOI for sleh_irq. Returns the raw IAR value (pass it
++ * back unchanged to y2s_gic_eoi: on GICv2 it carries the SGI source CPU)
++ * and stores the interrupt ID.
++ */
++uint32_t
++y2s_gic_ack(uint32_t *intid)
++{
++	if (y2s_gic_v2) {
++		uint32_t iar = gicc_read32(GICC_IAR);
++		*intid = iar & GICC_IAR_INTID_MASK;
++		return iar;
++	}
++	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
++	*intid = (uint32_t)(iar & 0xFFFFFF);
++	return (uint32_t)iar;
++}
++
++void
++y2s_gic_eoi(uint32_t iar)
++{
++	if (y2s_gic_v2) {
++		gicc_write32(GICC_EOIR, iar);
++	} else {
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", (uint64_t)iar);
++	}
++}
++
++/* Raise Y2S_IPI_SGI on a logical CPU. */
++void
++y2s_gic_send_ipi(unsigned int cpu, uint64_t target_mpidr)
++{
++	__builtin_arm_dsb(DSB_ISHST);
++	if (y2s_gic_v2) {
++		if (cpu == (unsigned int)ml_get_cpu_number_local()) {
++			/* TargetListFilter 0b10: the requesting CPU only. */
++			gicd_write32(GICD_SGIR, GICD_SGIR_TARGET_SELF | Y2S_IPI_SGI);
++			__builtin_arm_isb(ISB_SY);
++			return;
++		}
++		if (cpu >= GICV2_MAX_CPU_IF) {
++			panic("%s: CPU %u has no GICv2 CPU interface", __func__, cpu);
++		}
++		uint8_t mask = __atomic_load_n(&y2s_gicv2_cpu_mask[cpu], __ATOMIC_ACQUIRE);
++		if (mask == 0) {
++			panic("%s: CPU %u has not initialized its GICv2 CPU interface", __func__, cpu);
++		}
++		/* TargetListFilter 0 (use the list); NSATT is ignored for NS writes. */
++		gicd_write32(GICD_SGIR, ((uint32_t)mask << 16) | Y2S_IPI_SGI);
++	} else {
++		/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
++		unsigned int aff0 = target_mpidr & 0xff;
++		if (aff0 >= 16) {
++			panic("%s: SGI target requires unsupported range selector", __func__);
++		}
++		uint64_t sgi = (((target_mpidr >> 32) & 0xff) << 48) |
++		    (((target_mpidr >> 16) & 0xff) << 32) |
++		    (((target_mpidr >> 8) & 0xff) << 16) |
++		    ((uint64_t)Y2S_IPI_SGI << 24) | (1ULL << aff0);
++		__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
++	}
++	__builtin_arm_isb(ISB_SY);
++}
++#endif /* Y2S */
+ 
+ static vm_offset_t
+ find_gicr_pe_base()
+@@ -117,6 +317,14 @@ pe_init_fiq()
+ 			y2s_vtimer_intid = intid;
+ 		}
+ 		kprintf("Y2S GIC: virtual timer INTID %u\n", y2s_vtimer_intid);
++
++		y2s_gic_v2 = y2s_gic_compatible_is_v2(entry);
++		uint64_t pfr0_gic = (__builtin_arm_rsr64("ID_AA64PFR0_EL1") >> 24) & 0xf;
++		kprintf("Y2S GIC: %s, ID_AA64PFR0_EL1.GIC=%u\n",
++		    y2s_gic_v2 ? "GICv2 (memory-mapped GICC)" : "GICv3", (unsigned int)pfr0_gic);
++		if (!y2s_gic_v2 && pfr0_gic == 0) {
++			panic("%s: GICv3 node but this CPU has no GIC system register interface", __func__);
++		}
+ #endif
+ 
+ 		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
+@@ -133,15 +341,33 @@ pe_init_fiq()
+ 			panic("%s: cannot map GICD region", __func__);
+ 		}
+ 
+-		// Find GICR base address
+-		gicr_base = ml_io_map(soc_base_phys + gicr_base_prop, gicr_size_prop);
++#if defined(Y2S)
++		if (y2s_gic_v2) {
++			/* Second reg pair is the GICv2 CPU interface (GICC). */
++			gicc_base = ml_io_map(soc_base_phys + gicr_base_prop, gicr_size_prop);
++			if (!gicc_base) {
++				panic("%s: cannot map GICC region", __func__);
++			}
++		} else
++#endif
++		{
++			// Find GICR base address
++			gicr_base = ml_io_map(soc_base_phys + gicr_base_prop, gicr_size_prop);
+ 
+-		if (!gicr_base) {
+-			panic("%s: cannot map GICR region", __func__);
++			if (!gicr_base) {
++				panic("%s: cannot map GICR region", __func__);
++			}
++
++			gicr_size = gicr_size_prop;
+ 		}
++	}
+ 
+-		gicr_size = gicr_size_prop;
++#if defined(Y2S)
++	if (y2s_gic_v2) {
++		y2s_gicv2_init_cpu();
++		return;
+ 	}
++#endif
+ 
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..fc1068a 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,10 @@ int uart_getc(void);
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_Y2S)
+ extern uint32_t y2s_vtimer_intid;
++/* pe_fiq.c: GICv3 or GICv2, chosen from the device tree on the boot CPU. */
++extern uint32_t y2s_gic_ack(uint32_t *intid);
++extern void y2s_gic_eoi(uint32_t iar);
++extern void y2s_gic_send_ipi(unsigned int cpu, uint64_t target_mpidr);
+ #endif
+ 
+ #ifdef PRIVATE
+diff --git a/pexpert/pexpert/arm64/Y2S.h b/pexpert/pexpert/arm64/Y2S.h
+index b99c2f4..b6a6e8f 100644
+--- a/pexpert/pexpert/arm64/Y2S.h
++++ b/pexpert/pexpert/arm64/Y2S.h
+@@ -80,4 +80,30 @@
+ #define ICC_SRE_SRE                             0x1
+ /* End of GICv3 register definitions */
+ 
++/*
++ * GICv2 (GIC-400) register definitions, non-secure view; see GICv2 spec
++ * (Arm IHI 0048B) and the GIC-400 TRM. Used when /arm-io/gic is
++ * "arm,gic-400" (Exynos 990): reg = <GICD base, size, GICC base, size>.
++ */
++#define GICV2_MAX_CPU_IF          8       // GICv2 supports at most 8 CPU interfaces
++
++#define GICD_TYPER                0x004
++#define GICD_TYPER_CPUNUMBER_SHIFT 5      // bits [7:5]: number of CPU interfaces - 1
++#define GICD_ISENABLER            0x100   // banked word 0: SGIs + PPIs
++#define GICD_IPRIORITYR           0x400
++#define GICD_ITARGETSR            0x800   // words 0-7 banked, read-only
++#define GICD_SGIR                 0xF00
++#define GICD_SGIR_TARGET_SELF     (0x2U << 24) // TargetListFilter: requesting CPU only
++
++#define GICC_CTLR                 0x00
++#define GICC_PMR                  0x04
++#define GICC_BPR                  0x08
++#define GICC_IAR                  0x0C
++#define GICC_EOIR                 0x10
++
++#define GICC_CTLR_ENABLEGRP1      0x1     // NS view: bit 0 enables Group 1
++#define GICC_CTLR_BYPASS_MASK     0x1E0   // FIQ/IRQBypDisGrp0/1
++#define GICC_IAR_INTID_MASK       0x3FF
++/* End of GICv2 register definitions */
++
+ #endif /* ! _PEXPERT_ARM64_Y2S_H */

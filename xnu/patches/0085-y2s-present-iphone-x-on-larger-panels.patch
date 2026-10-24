@@ -1,0 +1,18 @@
+diff --git a/iokit/Kernel/arm/Y2SFramebuffer.cpp b/iokit/Kernel/arm/Y2SFramebuffer.cpp
+index 06e9477..c57f58a 100644
+--- a/iokit/Kernel/arm/Y2SFramebuffer.cpp
++++ b/iokit/Kernel/arm/Y2SFramebuffer.cpp
+@@ -170,7 +170,12 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("y2sfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= Y2S_FB_LOGICAL_W && fHeight <= Y2S_FB_LOGICAL_H) {
++	/*
++	 * Panels larger than the iPhone X (Galaxy S20+: 1440x3200) show the
++	 * presented 1125x2436 centred, with a black border; the copy below
++	 * clips both ways (negative fOffX/fOffY).
++	 */
++	if (!native) {
+ 		fLogicalW = Y2S_FB_LOGICAL_W;
+ 		fLogicalH = Y2S_FB_LOGICAL_H;
+ 	}

@@ -1,0 +1,113 @@
+diff --git a/bsd/dev/y2s_sample.c b/bsd/dev/y2s_sample.c
+index d71897c..a946a3d 100644
+--- a/bsd/dev/y2s_sample.c
++++ b/bsd/dev/y2s_sample.c
+@@ -19,6 +19,8 @@
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
++#include <sys/bsdtask_info.h>
++#include <mach/mach_time.h>
+ 
+ extern task_t proc_task(proc_t);
+ extern int hz;
+@@ -60,6 +62,79 @@ y2s_sample_proc(proc_t p, __unused void *arg)
+ 	return PROC_RETURNED;
+ }
+ 
++/*
++ * "top": CPU time (pti_total_user + system, mach absolute units) and
++ * pageins per process since the previous pass, 8 busiest printed as
++ * "TOP name[pid] cpu=<permille of the interval> pg=<pageins>".
++ */
++#define Y2S_TOP_MAX 160
++static struct { int pid; uint64_t cpu; int32_t pg; char name[20]; uint64_t dcpu; int32_t dpg; } y2s_top[Y2S_TOP_MAX];
++static int y2s_top_n;
++
++static int
++y2s_top_proc(proc_t p, __unused void *arg)
++{
++	struct proc_taskinfo_internal ti;
++	task_t task = proc_task(p);
++	int pid = proc_pid(p);
++	if (task == TASK_NULL) {
++		return PROC_RETURNED;
++	}
++	bzero(&ti, sizeof(ti));
++	fill_taskprocinfo(task, &ti);
++	uint64_t cpu = ti.pti_total_user + ti.pti_total_system;
++	int k;
++	for (k = 0; k < y2s_top_n && y2s_top[k].pid != pid; k++) {
++	}
++	if (k == y2s_top_n) {
++		if (y2s_top_n == Y2S_TOP_MAX) {
++			return PROC_RETURNED;
++		}
++		y2s_top_n++;
++		y2s_top[k].pid = pid;
++		y2s_top[k].cpu = 0;
++		y2s_top[k].pg = 0;
++	}
++	proc_name(pid, y2s_top[k].name, sizeof(y2s_top[k].name));
++	y2s_top[k].dcpu = cpu - y2s_top[k].cpu;
++	y2s_top[k].dpg = ti.pti_pageins - y2s_top[k].pg;
++	y2s_top[k].cpu = cpu;
++	y2s_top[k].pg = ti.pti_pageins;
++	return PROC_RETURNED;
++}
++
++static void
++y2s_top_pass(uint64_t interval)
++{
++	for (int k = 0; k < y2s_top_n; k++) {
++		y2s_top[k].dcpu = 0;
++		y2s_top[k].dpg = 0;
++	}
++	proc_iterate(PROC_ALLPROCLIST, y2s_top_proc, NULL, NULL, NULL);
++	uint64_t sum = 0;
++	int32_t pgsum = 0;
++	for (int k = 0; k < y2s_top_n; k++) {
++		sum += y2s_top[k].dcpu;
++		pgsum += y2s_top[k].dpg;
++	}
++	printf("TOP --- interval %llu, all procs cpu=%llu permille, pageins %d\n", interval,
++	    interval ? sum * 1000 / interval : 0, pgsum);
++	for (int shown = 0; shown < 8; shown++) {
++		int best = -1;
++		for (int k = 0; k < y2s_top_n; k++) {
++			if (y2s_top[k].dcpu && (best < 0 || y2s_top[k].dcpu > y2s_top[best].dcpu)) {
++				best = k;
++			}
++		}
++		if (best < 0) {
++			break;
++		}
++		printf("TOP %s[%d] cpu=%llu pg=%d\n", y2s_top[best].name, y2s_top[best].pid,
++		    interval ? y2s_top[best].dcpu * 1000 / interval : 0, y2s_top[best].dpg);
++		y2s_top[best].dcpu = 0;
++	}
++}
++
+ static void
+ y2s_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -71,10 +146,18 @@ y2s_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 		return;
+ 	}
+ 	(void)tsleep(&chan, PZERO, "y2ssmp", 90 * hz);
++	uint64_t last = mach_absolute_time();
++	y2s_top_pass(0);
+ 	for (int i = 0; i < 40; i++) {
+ 		printf("SMP --- sample %d\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, y2s_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "y2ssmp", 120 * hz);
++		/* top every 20 s between samples */
++		for (int j = 0; j < 6; j++) {
++			(void)tsleep(&chan, PZERO, "y2ssmp", 20 * hz);
++			uint64_t now = mach_absolute_time();
++			y2s_top_pass(now - last);
++			last = now;
++		}
+ 	}
+ }
+ 

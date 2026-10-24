@@ -1,0 +1,108 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 241b15a..6b773b1 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1843,7 +1843,7 @@ y2s_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = (uint64_t)Y2S_FB_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 9598ffd..741d0cf 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -521,10 +521,10 @@ LEXT(start_first_cpu)
+ 
+ #if defined(Y2S)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (Y2S_FB_PA + (Y2S_EARLY_FB_HEIGHT - 32) * Y2S_FB_STRIDE)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
++	MOV64	x4, Y2S_FB_STRIDE
+ Ly2s_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+@@ -692,7 +692,7 @@ Lkernelcache_base_found:
+ 	 * Y2S uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, Y2S_FB_BLOCK_PA
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+diff --git a/osfmk/arm64/y2s_early.c b/osfmk/arm64/y2s_early.c
+index ea757b8..3c4a55d 100644
+--- a/osfmk/arm64/y2s_early.c
++++ b/osfmk/arm64/y2s_early.c
+@@ -11,17 +11,21 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)Y2S_FB_PA;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_WIDTH ((unsigned int)Y2S_FB_WIDTH)
++#define EARLY_HEIGHT ((unsigned int)Y2S_EARLY_FB_HEIGHT)
++#define EARLY_STRIDE ((unsigned int)Y2S_FB_STRIDE / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+ #define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)
+ #define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
+ 
++_Static_assert(Y2S_EARLY_FB_HEIGHT <= Y2S_FB_HEIGHT &&
++    Y2S_FB_BLOCK_OFFSET + (uint64_t)Y2S_EARLY_FB_HEIGHT * Y2S_FB_STRIDE <= Y2S_FB_BLOCK_SIZE,
++    "early console must stay inside the framebuffer's 32MB block");
++
+ extern unsigned char iso_font[256 * 16];
+ 
+ /* Initialized data must remain writable until disable, including panics. */
+@@ -129,7 +133,8 @@ void
+ y2s_early_relocate(uint64_t base)
+ {
+ 	y2s_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	/* base maps the whole 32MB block that holds the framebuffer. */
++	early_fb = (volatile uint32_t *)(uintptr_t)(base + Y2S_FB_BLOCK_OFFSET);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	y2s_early_mark(9, "kernel framebuffer VA live");
+ }
+diff --git a/pexpert/pexpert/arm64/Y2S.h b/pexpert/pexpert/arm64/Y2S.h
+index e1912ba..5c389bb 100644
+--- a/pexpert/pexpert/arm64/Y2S.h
++++ b/pexpert/pexpert/arm64/Y2S.h
+@@ -48,6 +48,24 @@
+  * (CNTV) is INTID 16 + 3 = 19.
+  */
+ #define Y2S_VTIMER_INTID        19
++
++/*
++ * Galaxy S20+ (y2s, Exynos 990) boot framebuffer, as left by S-Boot
++ * (bootargs s3cfb.bootloaderfb=0xf1000000): 1440x3200 a8r8g8b8. The early
++ * console (y2s_early.c) and its bootstrap mappings use one 32MB L2 block
++ * (16K pages), so only the rows inside the block holding Y2S_FB_PA are used
++ * before the framebuffer driver takes over: (0xF2000000 - 0xF1000000) /
++ * 5760 = 2912 rows. The full mode is passed in boot_args.Video.
++ */
++#define Y2S_FB_PA               0xF1000000
++#define Y2S_FB_WIDTH            1440
++#define Y2S_FB_HEIGHT           3200
++#define Y2S_FB_STRIDE           (Y2S_FB_WIDTH * 4)
++#define Y2S_FB_BLOCK_SIZE       0x2000000       // ARM_TT_L2_SIZE with 16K pages
++#define Y2S_FB_BLOCK_PA         (Y2S_FB_PA & ~(Y2S_FB_BLOCK_SIZE - 1))
++#define Y2S_FB_BLOCK_OFFSET     (Y2S_FB_PA - Y2S_FB_BLOCK_PA)
++/* min(Y2S_FB_HEIGHT, rows left in the block); a literal so start.s can use it */
++#define Y2S_EARLY_FB_HEIGHT     2912
+ #define Y2S_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt

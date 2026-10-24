@@ -1,0 +1,633 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b258a4d..50f7b59 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/y2s_ufs.c			standard
+ bsd/dev/y2s_sample.c			standard
+ bsd/dev/y2s_keys.c			standard
+ bsd/dev/y2s_touch.c			standard
++bsd/dev/y2s_sects.c			standard
+ bsd/dev/y2s_rpmh.c			standard
+ bsd/dev/y2s_spmi.c			standard
+ bsd/dev/y2s_usb.c			standard
+diff --git a/bsd/dev/y2s_sects.c b/bsd/dev/y2s_sects.c
+new file mode 100644
+index 0000000..776aa5c
+--- /dev/null
++++ b/bsd/dev/y2s_sects.c
+@@ -0,0 +1,538 @@
++/*
++ * Galaxy S20+ (Exynos 990) touch: Samsung sec_ts (Y79A) at I2C 0x48 on
++ * HSI2C 0x108D0000 (USI v2), polled. Register use follows Samsung's
++ * drivers/i2c/busses/i2c-exynos5.c (polling mode, stop after every
++ * message) and drivers/input/touchscreen/sec_ts/y79a/sec_ts.c (event
++ * format). Relies on S-Boot/firmware for the touch regulators (DT
++ * regulator-boot-on) and HSI2C clocks (no CMU writes here).
++ *
++ * Coordinates: the IC reports 0..4095 on both axes (DT sec,max_coords);
++ * they are converted to the presented iPhone X display (1125x2436, drawn
++ * x32/25 with 41 black rows at the top, Y2SFramebuffer.cpp 0089) and
++ * handed to Y2SHID with y2s_touch_logical set.
++ */
++#if defined(ARM64_BOARD_CONFIG_Y2S)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void y2s_hid_touch(int finger, int down, int x, int y);
++extern int y2s_touch_logical;
++void y2s_sects_init(void);
++
++#define I2C_PA           0x108d0000u
++#define GPP5_PA          0x10730000u    /* PERIC1 pinctrl, bank gpp5 at +0 */
++#define PMIC_I2C_PA      0x10590000u    /* HSI2C with the S2DOS05 display PMIC */
++#define PMIC_ADDR        0x60
++#define GPP1_PA          0x10430000u    /* PERIC0 pinctrl */
++#define S2DOS05_EN       0x03           /* bit1 = LDO2 tsp_io, bit2 = LDO3 tsp_avdd */
++#define S2DOS05_LDO2_CFG 0x05           /* 1.5 V + 25 mV * sel -> 1.8 V = 12 */
++#define S2DOS05_LDO3_CFG 0x06           /* 2.7 V + 25 mV * sel -> 3.0 V = 12 */
++
++#define HSI2C_CTL        0x00
++#define HSI2C_FIFO_CTL   0x04
++#define HSI2C_TRAILIG    0x08
++#define HSI2C_INT_EN     0x20
++#define HSI2C_INT_STAT   0x24
++#define HSI2C_FIFO_STAT  0x30
++#define HSI2C_TX_DATA    0x34
++#define HSI2C_RX_DATA    0x38
++#define HSI2C_CONF       0x40
++#define HSI2C_AUTO_CONF  0x44
++#define HSI2C_TIMEOUT    0x48
++#define HSI2C_TRANS_STAT 0x50
++#define HSI2C_TIMING_FS1 0x60
++#define HSI2C_TIMING_FS2 0x64
++#define HSI2C_TIMING_FS3 0x68
++#define HSI2C_ADDR       0x70
++#define USI_CON          0xc4
++
++#define CTL_MASTER       (1u << 3)
++#define CTL_RXCHON       (1u << 6)
++#define CTL_TXCHON       (1u << 7)
++#define CTL_SW_RST       (1u << 31)
++#define CONF_AUTO_MODE   (1u << 31)
++#define AUTO_READ        (1u << 16)
++#define AUTO_STOP        (1u << 17)
++#define AUTO_RUN         (1u << 31)
++#define INT_XFER_DONE    (1u << 7)
++#define INT_ERRORS       (0xfu << 8)    /* incl. NODEV (bit 10) */
++#define FIFO_RX_EMPTY    (1u << 24)
++#define FIFO_TX_EMPTY    (1u << 8)
++#define FIFO_TX_LVL(x)   ((x) & 0x7f)
++
++#define TS_ADDR          0x48
++#define TS_SENSE_ON      0x10
++#define TS_DEVICE_ID     0x22
++#define TS_BOOT_STATUS   0x55
++#define TS_ONE_EVENT     0x60
++#define TS_ALL_EVENT     0x61
++#define TS_CLEAR_STACK   0x62
++#define TS_EVENT_SIZE    16
++#define TS_MAX_EVENTS    32
++#define TS_FINGERS       10
++
++#define LOGICAL_W        1125
++#define LOGICAL_H        2436
++#define PANEL_H          3200
++#define PAD_Y            41             /* (3200 - 2436 * 32 / 25) / 2 */
++
++static vm_offset_t i2c, gpio;
++static uint8_t i2c_addr = 0x48;
++static vm_offset_t pmic_i2c;
++static bool pmic_ok;
++static int sleep_chan;
++static int raw_logged;
++static uint32_t active;
++static int fx[TS_FINGERS], fy[TS_FINGERS];
++
++static uint32_t
++rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(i2c + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(i2c + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++wait_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++hsi2c_reset(void)
++{
++	wr(USI_CON, 0);                         /* release USI reset */
++	wr(HSI2C_CTL, rd(HSI2C_CTL) | CTL_SW_RST);
++	wr(HSI2C_CTL, rd(HSI2C_CTL) & ~CTL_SW_RST);
++	/*
++	 * Fast-mode timing as exynos5_i2c_set_timing() computes it, with the
++	 * divider for ~100 kHz from the DT's 200 MHz IP clock (slower is safe
++	 * if the clock is lower).
++	 */
++	/* 400 kHz from 200 MHz: fs_div 33, TSCL_H 0xe0, TSTART_HD 0xf0. */
++	wr(HSI2C_TIMING_FS3, (rd(HSI2C_TIMING_FS3) & ~0x00ff0000u) | (33u << 16));
++	wr(HSI2C_TIMING_FS2, (rd(HSI2C_TIMING_FS2) & ~0xffu) | 0xe0);
++	wr(HSI2C_TIMING_FS1, (rd(HSI2C_TIMING_FS1) & ~0x00ff0000u) | (0xf0u << 16));
++	wr(HSI2C_CTL, CTL_MASTER);
++	wr(HSI2C_TRAILIG, 0xffffff);
++	wr(HSI2C_CONF, rd(HSI2C_CONF) | CONF_AUTO_MODE);
++}
++
++/* One message with STOP (DT samsung,stop-after-trans). 0 = ok. */
++static int
++hsi2c_msg(bool read, uint8_t *buf, unsigned len)
++{
++	uint32_t ctl = rd(HSI2C_CTL), auto_conf = rd(HSI2C_AUTO_CONF);
++	unsigned trig = len < 32 ? len : 32, n = 0;
++
++	wr(HSI2C_TIMEOUT, rd(HSI2C_TIMEOUT) & ~(1u << 31));
++	wr(HSI2C_FIFO_CTL, 3u | (trig << 4) | (trig << 16));
++	if (read) {
++		ctl = (ctl & ~CTL_TXCHON) | CTL_RXCHON;
++		auto_conf |= AUTO_READ;
++	} else {
++		ctl = (ctl & ~CTL_RXCHON) | CTL_TXCHON;
++		auto_conf &= ~AUTO_READ;
++	}
++	auto_conf |= AUTO_STOP;
++	wr(HSI2C_ADDR, (rd(HSI2C_ADDR) & ~(0xffu << 24 | 0xfffffu)) | (7u << 24) | ((uint32_t)i2c_addr << 10));
++	wr(HSI2C_CTL, ctl);
++	wr(HSI2C_INT_STAT, rd(HSI2C_INT_STAT));
++	wr(HSI2C_INT_EN, INT_XFER_DONE);
++	wr(HSI2C_AUTO_CONF, (auto_conf & ~0xffffu) | len);
++	wr(HSI2C_AUTO_CONF, rd(HSI2C_AUTO_CONF) | AUTO_RUN);
++
++	for (unsigned t = 0; t < 20000; t++) {         /* ~20 ms + access time */
++		if (read) {
++			while (n < len && !(rd(HSI2C_FIFO_STAT) & FIFO_RX_EMPTY)) {
++				buf[n++] = (uint8_t)rd(HSI2C_RX_DATA);
++			}
++			if (n >= len) {
++				return 0;
++			}
++		} else {
++			while (n < len && FIFO_TX_LVL(rd(HSI2C_FIFO_STAT)) < 16) {
++				wr(HSI2C_TX_DATA, buf[n++]);
++			}
++			uint32_t is = rd(HSI2C_INT_STAT);
++			if (n >= len && (is & INT_XFER_DONE) && (rd(HSI2C_FIFO_STAT) & FIFO_TX_EMPTY)) {
++				wr(HSI2C_INT_STAT, is);
++				return 0;
++			}
++		}
++		if (rd(HSI2C_INT_STAT) & INT_ERRORS) {
++			break;
++		}
++		delay(1);
++	}
++	uint32_t is = rd(HSI2C_INT_STAT), ts = rd(HSI2C_TRANS_STAT);
++	hsi2c_reset();
++	return (int)(0x80000000u | (is & 0xffffu) << 8 | (ts & 0xff));
++}
++
++static int
++pmic_rd(uint8_t reg, uint8_t *v)
++{
++	int r = hsi2c_msg(false, &reg, 1);
++	return r ? r : hsi2c_msg(true, v, 1);
++}
++
++static int
++pmic_wr(uint8_t reg, uint8_t v)
++{
++	uint8_t b[2] = { reg, v };
++	return hsi2c_msg(false, b, 2);
++}
++
++/* Switch on the touch supplies (DT: s2dos05 ldo2 tsp_io 1.8 V, ldo3 tsp_avdd 3.0 V). */
++static void
++touch_power(void)
++{
++	uint8_t id = 0, en = 0, l2 = 0, l3 = 0;
++	i2c = ml_io_map(PMIC_I2C_PA, 0x1000);
++	i2c_addr = PMIC_ADDR;
++	printf("Y2S SECTS: pmic bus ctl 0x%08x conf 0x%08x usi 0x%08x\n",
++	    rd(HSI2C_CTL), rd(HSI2C_CONF), rd(USI_CON));
++	/*
++	 * HSI2C4 sits on USI02, a UART/SPI/I2C port: select I2C (USI v2 mode 4)
++	 * in SYSREG_PERIC0 (DT usi@10421014 usi_v2_mode = "i2c"). Also log its
++	 * CMU_PERIC0 clocks (cmucal-sfr.c: QCH 0x302c, gate 0x20c4, IPCLK_9
++	 * 0x2044, PCLK_9 0x2074, div 0x180c, user mux 0x640).
++	 */
++	{
++		vm_offset_t sys = ml_io_map(0x10421000u, 0x1000);
++		vm_offset_t cmu = ml_io_map(0x10400000u, 0x8000);
++		volatile uint32_t *mode = (volatile uint32_t *)(sys + 0x014);  /* USI02_USI (0x1004 USI00, 0x100c USI01) */
++		uint32_t before = *mode;
++		*mode = 0x4;
++		__asm__ volatile ("dsb osh" ::: "memory");
++		printf("Y2S SECTS: usi02 mode 0x%x -> 0x%x; cmu qch 0x%08x gate 0x%08x ip9 0x%08x p9 0x%08x div 0x%08x mux 0x%08x\n",
++		    before, *mode,
++		    *(volatile uint32_t *)(cmu + 0x302c), *(volatile uint32_t *)(cmu + 0x20c4),
++		    *(volatile uint32_t *)(cmu + 0x2044), *(volatile uint32_t *)(cmu + 0x2074),
++		    *(volatile uint32_t *)(cmu + 0x180c), *(volatile uint32_t *)(cmu + 0x640));
++	}
++	/* gpp1-0/1 = HSI2C4 SCL/SDA, function 2, no pull (DT hsi2c4-bus); PERIC0 pinctrl, gpp1 at +0x20. */
++	{
++		vm_offset_t p0 = ml_io_map(GPP1_PA, 0x1000);
++		volatile uint32_t *con = (volatile uint32_t *)(p0 + 0x20);
++		volatile uint32_t *pud = (volatile uint32_t *)(p0 + 0x28);
++		printf("Y2S SECTS: gpp1 con 0x%08x pud 0x%08x\n", *con, *pud);
++		*con = (*con & ~0xffu) | 0x22u;
++		*pud = *pud & ~0xffu;
++		__asm__ volatile ("dsb osh" ::: "memory");
++	}
++	hsi2c_reset();
++	printf("Y2S SECTS: pmic bus after reset ctl 0x%08x conf 0x%08x usi 0x%08x trans 0x%08x fs3 0x%08x\n",
++	    rd(HSI2C_CTL), rd(HSI2C_CONF), rd(USI_CON), rd(HSI2C_TRANS_STAT), rd(HSI2C_TIMING_FS3));
++	int r0 = pmic_rd(0x00, &id);
++	int r1 = pmic_rd(S2DOS05_EN, &en);
++	(void)pmic_rd(S2DOS05_LDO2_CFG, &l2);
++	(void)pmic_rd(S2DOS05_LDO3_CFG, &l3);
++	printf("Y2S SECTS: s2dos05 rc 0x%x/0x%x id 0x%02x en 0x%02x ldo2 0x%02x ldo3 0x%02x\n",
++	    r0, r1, id, en, l2, l3);
++	pmic_ok = (r1 == 0);
++	pmic_i2c = i2c;
++	i2c_addr = TS_ADDR;
++}
++
++/*
++ * Reset a stuck touch IC by switching S2DOS05 supplies in `mask` off for
++ * 50 ms (bit2 = LDO3 tsp_avdd, bit1 = LDO2 tsp_io). Cycling both at once
++ * also blanked the panel, so one rail at a time, LDO3 first.
++ */
++static void
++touch_cycle(uint8_t mask, unsigned off_us)
++{
++	vm_offset_t touch_i2c = i2c;
++	uint8_t en = 0;
++	if (!pmic_ok) {
++		return;
++	}
++	i2c = pmic_i2c;
++	i2c_addr = PMIC_ADDR;
++	if (pmic_rd(S2DOS05_EN, &en) == 0) {
++		/*
++		 * The panel runs from LDO1 (ddi-vdd3), LDO4 (ddi-vci) and BUCK1
++		 * (ddr-vddr) (DT dsim regulators). EN reads 0x0e with the LDO1 and
++		 * BUCK1 bits clear while the panel is lit, so writing EN back
++		 * without them switched the panel off. Keep bits 0/3/4 set.
++		 */
++		const uint8_t panel = 0x19;
++		uint8_t en2 = 0;
++		(void)pmic_wr(S2DOS05_EN, (uint8_t)((en | panel) & ~mask));
++		delay(off_us);                  /* microseconds */
++		int rw = pmic_wr(S2DOS05_EN, (uint8_t)(en | panel | mask));
++		(void)pmic_rd(S2DOS05_EN, &en2);
++		printf("Y2S SECTS: cycled supply mask 0x%02x for %u us (en 0x%02x -> 0x%02x), rc 0x%x\n",
++		    mask, off_us, en, en2, rw);
++	}
++	i2c = touch_i2c;
++	i2c_addr = TS_ADDR;
++	wait_ms(300);                           /* IC boot after power-on */
++}
++
++static int
++ts_cmd(uint8_t cmd)
++{
++	return hsi2c_msg(false, &cmd, 1);
++}
++
++static int
++ts_read(uint8_t reg, uint8_t *buf, unsigned len)
++{
++	int r = hsi2c_msg(false, &reg, 1);
++	return r ? r : hsi2c_msg(true, buf, len);
++}
++
++static void
++ts_event(const uint8_t *e)
++{
++	unsigned eid = e[0] & 3, tid = (e[0] >> 2) & 0xf, sta = e[0] >> 6;
++	if (eid != 0 || tid == 0 || tid > TS_FINGERS) {
++		if (raw_logged < 40) {
++			raw_logged++;
++			printf("Y2S SECTS: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++		}
++		return;
++	}
++	int rx = (e[1] << 4) | (e[3] >> 4), ry = (e[2] << 4) | (e[3] & 0xf);
++	unsigned id = tid - 1;
++	if (raw_logged < 40) {
++		raw_logged++;
++		printf("Y2S SECTS: finger %u sta %u raw %d,%d\n", id, sta, rx, ry);
++	}
++	int x = rx * LOGICAL_W / 4096;
++	int y = ((ry * PANEL_H / 4096) - PAD_Y) * 25 / 32;
++	if (sta == 3) {                         /* release */
++		if (active & (1u << id)) {
++			active &= ~(1u << id);
++			y2s_hid_touch((int)id, 0, fx[id], fy[id]);
++		}
++		return;
++	}
++	if (sta == 1 || sta == 2) {             /* press / move */
++		if (!(active & (1u << id)) || x != fx[id] || y != fy[id]) {
++			fx[id] = x;
++			fy[id] = y;
++			active |= 1u << id;
++			y2s_hid_touch((int)id, 1, x, y);
++		}
++	}
++}
++
++/*
++ * I2C bus recovery on gpp5-6 (SCL) / gpp5-7 (SDA) as GPIOs, open-drain
++ * style (high = input + pull-up, low = output 0): 9 clocks, then STOP.
++ * Logs the line levels with pull-ups and after recovery. Leaves both
++ * pins as inputs without pulls.
++ */
++static void
++bus_recover(void)
++{
++	volatile uint32_t *con = (volatile uint32_t *)gpio;
++	volatile uint32_t *dat = (volatile uint32_t *)(gpio + 4);
++	volatile uint32_t *pud = (volatile uint32_t *)(gpio + 8);
++#define LVL(pin) ((*dat >> (pin)) & 1u)
++#define REL(pin) (*con = *con & ~(0xfu << (4 * (pin))))
++#define LOW(pin) do { *dat = *dat & ~(1u << (pin)); \
++	*con = (*con & ~(0xfu << (4 * (pin)))) | (1u << (4 * (pin))); } while (0)
++
++	REL(6);
++	REL(7);
++	*pud = (*pud & 0x00ffffffu) | 0x33000000u;      /* pull-up */
++	__asm__ volatile ("dsb osh" ::: "memory");
++	delay(200);
++	printf("Y2S SECTS: with pull-ups scl %u sda %u\n", LVL(6), LVL(7));
++	unsigned released = 0;
++	for (int i = 0; i < 9; i++) {
++		LOW(6);
++		delay(10);
++		REL(6);
++		delay(10);
++		if (LVL(7)) {
++			released++;
++		}
++	}
++	/* STOP: SDA low while SCL high, then release SDA. */
++	LOW(7);
++	delay(10);
++	REL(6);
++	delay(10);
++	REL(7);
++	delay(50);
++	printf("Y2S SECTS: after 9 clocks + stop scl %u sda %u (sda high on %u clocks)\n",
++	    LVL(6), LVL(7), released);
++	*pud = *pud & 0x00ffffffu;
++	__asm__ volatile ("dsb osh" ::: "memory");
++#undef LVL
++#undef REL
++#undef LOW
++}
++
++static void
++sects_thread(void *arg, wait_result_t wr_)
++{
++	unsigned delay_s = 30;
++	uint8_t ev[TS_MAX_EVENTS][TS_EVENT_SIZE];
++	(void)arg;
++	(void)wr_;
++	(void)PE_parse_boot_argn("y2stouchdelay", &delay_s, sizeof(delay_s));
++	printf("Y2S SECTS: starting in %u s\n", delay_s);
++	wait_ms(delay_s * 1000u);
++
++	touch_power();
++	i2c = ml_io_map(I2C_PA, 0x1000);
++	gpio = ml_io_map(GPP5_PA, 0x1000);
++	/* gpp5-6/7 = HSI2C SCL/SDA (function 3), no pull (DT tspi2c-bus). */
++	volatile uint32_t *con = (volatile uint32_t *)gpio;
++	volatile uint32_t *pud = (volatile uint32_t *)(gpio + 8);
++	printf("Y2S SECTS: gpp5 con 0x%08x pud 0x%08x, hsi2c ctl 0x%08x conf 0x%08x usi 0x%08x\n",
++	    *con, *pud, rd(HSI2C_CTL), rd(HSI2C_CONF), rd(USI_CON));
++	/* Line levels with SCL/SDA as plain inputs, no pulls: 1/1 = bus idle-high. */
++	*con = *con & 0x00ffffffu;
++	*pud = *pud & 0x00ffffffu;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	delay(100);
++	printf("Y2S SECTS: lines scl %u sda %u\n",
++	    (*(volatile uint32_t *)(gpio + 4) >> 6) & 1, (*(volatile uint32_t *)(gpio + 4) >> 7) & 1);
++	bus_recover();
++	/*
++	 * Touch HSI2C clocks in CMU_PERIC1 (cmucal-sfr.c): QCH USI07_I2C 0x3038,
++	 * gate RSTNSYNC USI_I2C 0x2104, div 0x182c, user mux 0x6c0. Force the
++	 * gate (MANUAL bit20 + CG_VAL bit21) and Q-channel (CLOCK_REQ, no auto) on.
++	 */
++	{
++		vm_offset_t cmu = ml_io_map(0x10700000u, 0x8000);
++		volatile uint32_t *qch = (volatile uint32_t *)(cmu + 0x3038);
++		volatile uint32_t *gate = (volatile uint32_t *)(cmu + 0x2104);
++		printf("Y2S SECTS: peric1 qch 0x%08x gate 0x%08x div 0x%08x mux 0x%08x\n",
++		    *qch, *gate, *(volatile uint32_t *)(cmu + 0x182c), *(volatile uint32_t *)(cmu + 0x6c0));
++		*gate = *gate | (3u << 20);
++		*qch = (*qch & ~1u) | 2u;
++		__asm__ volatile ("dsb osh" ::: "memory");
++		printf("Y2S SECTS: peric1 now qch 0x%08x gate 0x%08x\n", *qch, *gate);
++	}
++	*con = (*con & 0x00ffffffu) | 0x33000000u;
++	*pud = *pud & 0x00ffffffu;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	hsi2c_reset();
++
++	uint8_t id[5] = {0}, boot = 0;
++	int r1 = ts_read(TS_DEVICE_ID, id, 5);
++	/* Stuck IC (holds SCL/SDA low after S-Boot): least disruptive reset first. */
++	/*
++	 * LDO2 (tsp_io) also feeds the panel: a 50 ms cycle frees the IC but
++	 * blanks the display. Shortest dip first; the panel's decoupling may
++	 * ride through one the IC already resets on.
++	 */
++	static const struct { uint8_t mask; unsigned us; } tries[] = {
++		{ 0x02, 30000 },        /* LDO2 tsp_io off 30 ms, as sec_ts_power() */
++	};
++	/* Power cycle on by default; y2stouchcycle=0 disables it. */
++	int allow_cycle = 1;
++	(void)PE_parse_boot_argn("y2stouchcycle", &allow_cycle, sizeof(allow_cycle));
++	for (unsigned t = 0; allow_cycle && r1 != 0 && t < sizeof(tries) / sizeof(tries[0]); t++) {
++		printf("Y2S SECTS: id rc 0x%x, try %u\n", r1, t);
++		touch_cycle(tries[t].mask, tries[t].us);
++		r1 = ts_read(TS_DEVICE_ID, id, 5);
++	}
++	int r2 = ts_read(TS_BOOT_STATUS, &boot, 1);
++	printf("Y2S SECTS: id rc 0x%x %02x %02x %02x %02x %02x, boot rc 0x%x status 0x%02x\n",
++	    r1, id[0], id[1], id[2], id[3], id[4], r2, boot);
++	if (r1 != 0) {
++		printf("Y2S SECTS: no answer from the touch IC, giving up\n");
++		return;
++	}
++	(void)ts_cmd(TS_CLEAR_STACK);
++	int r3 = ts_cmd(TS_SENSE_ON);
++	printf("Y2S SECTS: sense on rc 0x%x, polling\n", r3);
++	y2s_touch_logical = 1;
++
++	/*
++	 * The IC pulls its interrupt line (gpa1-0, ALIVE pinctrl 0x15850000,
++	 * bank +0x20, DAT +0x04) low while events are pending: poll that pin
++	 * (no I2C traffic, no busy-wait) and read events only when it is low.
++	 * Every 50th idle tick an I2C read is done anyway, in case the line
++	 * does not behave as expected.
++	 */
++	vm_offset_t alive = ml_io_map(0x15850000u, 0x1000);
++	volatile uint32_t *attn = (volatile uint32_t *)(alive + 0x24);
++	printf("Y2S SECTS: attn line %u (gpa1 con 0x%08x)\n", *attn & 1,
++	    *(volatile uint32_t *)(alive + 0x20));
++	unsigned idle = 0;
++
++	for (unsigned errors = 0;;) {
++		if ((*attn & 1) && ++idle < 50) {
++			wait_ms(8);
++			continue;
++		}
++		idle = 0;
++		int r = ts_read(TS_ONE_EVENT, ev[0], TS_EVENT_SIZE);
++		if (r != 0) {
++			if (++errors < 10) {
++				printf("Y2S SECTS: read rc 0x%x\n", r);
++			}
++			wait_ms(100);
++			continue;
++		}
++		if (ev[0][0] == 0) {
++			wait_ms(8);
++			continue;
++		}
++		if ((ev[0][0] & 3) == 3) {
++			(void)ts_cmd(TS_CLEAR_STACK);
++			continue;
++		}
++		unsigned left = ev[0][7] & 0x1f;
++		if (left > TS_MAX_EVENTS - 1) {
++			left = TS_MAX_EVENTS - 1;
++		}
++		if (left && ts_read(TS_ALL_EVENT, ev[1], left * TS_EVENT_SIZE) != 0) {
++			left = 0;
++		}
++		for (unsigned i = 0; i <= left; i++) {
++			ts_event(ev[i]);
++		}
++	}
++}
++
++void
++y2s_sects_init(void)
++{
++	static bool started;
++	int enabled = 1;
++	thread_t thread;
++	if (started) {
++		return;
++	}
++	started = true;
++	(void)PE_parse_boot_argn("y2stouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("Y2S SECTS: disabled (y2stouch=0)\n");
++		return;
++	}
++	if (kernel_thread_start(sects_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_Y2S */
+diff --git a/bsd/dev/y2s_ufs.c b/bsd/dev/y2s_ufs.c
+index 42c3a5e..f1efb0f 100644
+--- a/bsd/dev/y2s_ufs.c
++++ b/bsd/dev/y2s_ufs.c
+@@ -61,6 +61,7 @@ static void y2s_log_start(void);
+ extern void y2s_sample_start(void);
+ extern void y2s_keys_init(void);
+ extern void y2s_touch_init(void);
++extern void y2s_sects_init(void);
+ extern void y2s_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -855,11 +856,13 @@ y2s_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	y2s_log_start();
+ 	y2s_sample_start();
+-	/* Input drivers (HID services in iokit/Kernel/arm/hid/Y2SHID.cpp): Qualcomm only. */
++	/* Input drivers (HID services in iokit/Kernel/arm/hid/Y2SHID.cpp). */
+ 	if (!su.exynos) {
+ 		y2s_keys_init();
+ 		y2s_touch_init();
+ 		y2s_usb_probe();
++	} else {
++		y2s_sects_init();       /* Galaxy S20+ sec_ts */
+ 	}
+ 	return 0;
+ }
+diff --git a/iokit/Kernel/arm/hid/Y2SHID.cpp b/iokit/Kernel/arm/hid/Y2SHID.cpp
+index f2e6d1f..01e6538 100644
+--- a/iokit/Kernel/arm/hid/Y2SHID.cpp
++++ b/iokit/Kernel/arm/hid/Y2SHID.cpp
+@@ -448,6 +448,10 @@ Y2SHIDTouch::start(IOService *provider)
+ 	return true;
+ }
+ 
++/* Set by the S20 touch driver (bsd/dev/y2s_sects.c): x/y already in presented-display pixels. */
++extern "C" int y2s_touch_logical;
++int y2s_touch_logical;
++
+ void
+ Y2SHIDTouch::touch(int finger, bool down, int x, int y)
+ {
+@@ -458,22 +462,28 @@ Y2SHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= Y2S_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	int panelW = 1080, panelH = 2400, offX = fOffX, offY = fOffY;
++	if (y2s_touch_logical) {
++		panelW = (int)fLogicalW;
++		panelH = (int)fLogicalH;
++		offX = offY = 0;
++	}
++	x = x < 0 ? 0 : (x > panelW - 1 ? panelW - 1 : x);
++	y = y < 0 ? 0 : (y > panelH - 1 ? panelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (Y2SFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	IOFixed nx = (IOFixed)(((int64_t)(x + offX) << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)(((int64_t)(y + offY) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < Y2S_TOUCH_EDGE_PX || x > 1079 - Y2S_TOUCH_EDGE_PX ||
+-		    y < Y2S_TOUCH_EDGE_PX || y > 2399 - Y2S_TOUCH_EDGE_PX;
++		fEdge[finger] = x < Y2S_TOUCH_EDGE_PX || x > panelW - 1 - Y2S_TOUCH_EDGE_PX ||
++		    y < Y2S_TOUCH_EDGE_PX || y > panelH - 1 - Y2S_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);

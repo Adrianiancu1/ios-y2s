@@ -1,0 +1,145 @@
+diff --git a/iokit/Kernel/arm/Y2SFramebuffer.cpp b/iokit/Kernel/arm/Y2SFramebuffer.cpp
+index c57f58a..e28d464 100644
+--- a/iokit/Kernel/arm/Y2SFramebuffer.cpp
++++ b/iokit/Kernel/arm/Y2SFramebuffer.cpp
+@@ -104,6 +104,9 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fScaled;                  /* 1125-wide logical -> 1440 panel, x32/25 */
++	bool          fPadCleared;
++	int32_t       fPadY;                    /* panel rows above the scaled image */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	Y2SSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -122,6 +125,8 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void presentScaled(Y2SSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
++	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -180,6 +185,18 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalH = Y2S_FB_LOGICAL_H;
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
++	/*
++	 * Galaxy S20+: stretch the presented 1125x2436 by 32/25 (= 1440/1125)
++	 * to 1440x3118, centred vertically. y2sfb_scale=0 keeps it 1:1 centred.
++	 */
++	{
++		int scale = 1;
++		PE_parse_boot_argn("y2sfb_scale", &scale, sizeof(scale));
++		fScaled = !native && scale != 0 && fLogicalW * 32 == fWidth * 25 &&
++		    (fLogicalH * 32 + 24) / 25 <= fHeight;
++		fPadY = fScaled ? (int32_t)(fHeight - (fLogicalH * 32 + 24) / 25) / 2 : 0;
++		fPadCleared = false;
++	}
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+@@ -364,6 +381,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fScaled) {
++			presentScaled(s, src, bpe, sx, sy, dx, dy, w, h);
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
+@@ -406,6 +428,90 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ }
+ 
++/*
++ * Nearest-neighbour stretch of one layer by 32/25: panel pixel p shows
++ * logical pixel p * 25 / 32. Rows that repeat a logical row are copied
++ * from the panel row above.
++ */
++void
++AppleCLCD::presentScaled(Y2SSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
++    int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	if (!fPadCleared) {
++		fPadCleared = true;
++		for (int32_t y = 0; y < (int32_t)fHeight; y++) {
++			if (y < fPadY || y >= (int32_t)fHeight - fPadY - 1) {
++				bzero((void *)(fPixels + (uint64_t)y * fRowBytes), (size_t)fWidth * 4);
++			}
++		}
++	}
++	if (src == 0 || bpe != 4 || s->elementWidth != 1 || s->elementHeight != 1 || s->memory == NULL) {
++		return;
++	}
++	/* Clip in logical coordinates: source surface and logical screen. */
++	if (w > (int32_t)s->width - sx) {
++		w = (int32_t)s->width - sx;
++	}
++	if (h > (int32_t)s->height - sy) {
++		h = (int32_t)s->height - sy;
++	}
++	if (w > (int32_t)fLogicalW - dx) {
++		w = (int32_t)fLogicalW - dx;
++	}
++	if (h > (int32_t)fLogicalH - dy) {
++		h = (int32_t)fLogicalH - dy;
++	}
++	if (w <= 0 || h <= 0) {
++		return;
++	}
++	uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++	    (uint64_t)(sx + w) * 4;
++	if (last > s->memory->getLength()) {
++		return;
++	}
++	int32_t px0 = (dx * 32 + 24) / 25, px1 = ((dx + w) * 32 + 24) / 25;
++	int32_t py0 = fPadY + (dy * 32 + 24) / 25, py1 = fPadY + ((dy + h) * 32 + 24) / 25;
++	if (px1 > (int32_t)fWidth) {
++		px1 = (int32_t)fWidth;
++	}
++	if (py1 > (int32_t)fHeight) {
++		py1 = (int32_t)fHeight;
++	}
++	/*
++	 * Build each stretched row in a cached buffer and copy it to the panel
++	 * with one memcpy; repeated rows reuse the buffer. Per-pixel stores to
++	 * (and reads back from) the uncached framebuffer made every frame
++	 * visibly paint top to bottom on one CPU.
++	 */
++	static uint32_t rowbuf[2048];
++	static int32_t lxmap[2048];
++	if (px1 - px0 > 2048) {
++		px1 = px0 + 2048;
++	}
++	for (int32_t px = px0; px < px1; px++) {
++		int32_t lx = px * 25 / 32 - dx;
++		lxmap[px - px0] = lx < 0 ? 0 : (lx >= w ? w - 1 : lx);
++	}
++	const size_t rowlen = (size_t)(px1 - px0) * 4;
++	int32_t prev = -1;
++	for (int32_t py = py0; py < py1; py++) {
++		int32_t ly = (py - fPadY) * 25 / 32 - dy;
++		if (ly < 0) {
++			ly = 0;
++		} else if (ly >= h) {
++			ly = h - 1;
++		}
++		if (ly != prev) {
++			prev = ly;
++			const uint32_t *srow = (const uint32_t *)(src + s->offset + (uint64_t)(sy + ly) * s->bytesPerRow) + sx;
++			for (int32_t i = 0; i < px1 - px0; i++) {
++				rowbuf[i] = srow[lxmap[i]];
++			}
++		}
++		memcpy((void *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4), rowbuf, rowlen);
++	}
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {

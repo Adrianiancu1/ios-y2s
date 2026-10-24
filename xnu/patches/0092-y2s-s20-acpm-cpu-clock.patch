@@ -1,0 +1,240 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 50f7b59..262920d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/y2s_sample.c			standard
+ bsd/dev/y2s_keys.c			standard
+ bsd/dev/y2s_touch.c			standard
+ bsd/dev/y2s_sects.c			standard
++bsd/dev/y2s_acpm.c			standard
+ bsd/dev/y2s_rpmh.c			standard
+ bsd/dev/y2s_spmi.c			standard
+ bsd/dev/y2s_usb.c			standard
+diff --git a/bsd/dev/y2s_acpm.c b/bsd/dev/y2s_acpm.c
+new file mode 100644
+index 0000000..5a56f35
+--- /dev/null
++++ b/bsd/dev/y2s_acpm.c
+@@ -0,0 +1,202 @@
++/*
++ * Galaxy S20+ (Exynos 990): raise the boot cluster's clock through ACPM,
++ * the power-management microcontroller that owns CPU voltage and PLLs.
++ * Protocol from Samsung's drivers/soc/samsung/acpm/acpm_ipc.c and
++ * cal-if/acpm_dvfs.c; addresses from the DT acpm_ipc / acpm_dvfs nodes:
++ *   mailbox 0x15900000 (INTGR0 0x08: raise (1 << id) << 16 to ACPM;
++ *   INTCR1 0x20 / INTSR1 0x28: ACPM -> AP), SRAM 0x02039000 (0x38000),
++ *   framework init data at SRAM + 0x7000, DVFS on IPC channel 5.
++ * A DVFS message is 4 words { id | seq << 16, kHz, 0 = set / 1 = get, 0 };
++ * cluster 0 (Cortex-A55) is id 2 (acpm_dvfs_exynos9830.h). ACPM sets
++ * voltage and PLL itself. Boot-arg y2scpukhz (default 2002000, 0 = leave).
++ */
++#if defined(ARM64_BOARD_CONFIG_Y2S)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void y2s_acpm_init(void);
++
++#define ACPM_MBOX_PA    0x15900000u
++#define ACPM_SRAM_PA    0x02039000u
++#define ACPM_SRAM_SIZE  0x38000u
++#define ACPM_INITDATA   0x7000u
++#define INTGR0          0x08
++#define INTCR1          0x20
++#define INTSR1          0x28
++#define DVFS_CH         5
++#define DVFS_CPUCL0     2
++#define FREQ_REQ        0
++#define FREQ_GET        1
++
++static vm_offset_t mbox, sram;
++static uint32_t ch_id, q_len, q_size;
++static uint32_t tx_front, tx_rear, tx_base;     /* AP -> ACPM (ACPM rx_*) */
++static uint32_t rx_front, rx_rear, rx_base;     /* ACPM -> AP (ACPM tx_*) */
++static uint32_t seq;
++
++static uint32_t
++r32(vm_offset_t a)
++{
++	uint32_t v = *(volatile uint32_t *)a;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++w32(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)a = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* Send one 4-word command and wait (polling) for its response. 0 = ok. */
++static int
++acpm_xfer(uint32_t cmd[4])
++{
++	uint32_t front = r32(sram + tx_front);
++	uint32_t next = (front + 1) % q_len;
++	uint64_t t0 = mach_absolute_time(), lim;
++	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &lim);
++
++	printf("Y2S ACPM: xfer tx front %u rear %u, rx front %u rear %u, intsr1 0x%x\n",
++	    front, r32(sram + tx_rear), r32(sram + rx_front), r32(sram + rx_rear), r32(mbox + INTSR1));
++	/* 1-slot queue: the ring "full" test can never pass; just use the slot. */
++	while (q_len > 1 && next == r32(sram + tx_rear)) {
++		if (mach_absolute_time() - t0 > lim) {
++			return -1;
++		}
++	}
++	if (++seq >= 64) {
++		seq = 1;
++	}
++	cmd[0] = (cmd[0] & ~(0x3fu << 16)) | (seq << 16);
++	for (unsigned i = 0; i < 4 && i * 4 < q_size; i++) {
++		w32(sram + tx_base + q_size * front + 4 * i, cmd[i]);
++	}
++	w32(sram + tx_front, next);
++	w32(mbox + INTGR0, (1u << ch_id) << 16);
++
++	t0 = mach_absolute_time();
++	for (;;) {
++		uint32_t rr = r32(sram + rx_rear), rf = r32(sram + rx_front);
++		bool got = (rr != rf);
++		if (!got && q_len == 1 && (r32(mbox + INTSR1) & (1u << ch_id))) {
++			vm_offset_t e = sram + rx_base;
++			printf("Y2S ACPM: intsr1 set, slot 0x%x 0x%x 0x%x 0x%x front %u rear %u\n",
++			    r32(e), r32(e + 4), r32(e + 8), r32(e + 12), rf, rr);
++			for (unsigned i = 0; i < 4; i++) {
++				cmd[i] = r32(e + 4 * i);
++			}
++			w32(mbox + INTCR1, 1u << ch_id);
++			return 0;
++		}
++		if (got) {
++			vm_offset_t e = sram + rx_base + q_size * rr;
++			uint32_t r0 = r32(e);
++			if (((r0 >> 16) & 0x3f) == seq) {
++				for (unsigned i = 0; i < 4 && i * 4 < q_size; i++) {
++					cmd[i] = r32(e + 4 * i);
++				}
++			}
++			w32(sram + rx_rear, (rr + 1) % q_len);
++			w32(mbox + INTCR1, 1u << ch_id);
++			if (((r0 >> 16) & 0x3f) == seq) {
++				return 0;
++			}
++			continue;
++		}
++		if (mach_absolute_time() - t0 > lim) {
++			printf("Y2S ACPM: timeout: tx front %u rear %u, rx front %u rear %u, intsr1 0x%x, slot 0x%x 0x%x\n",
++			    r32(sram + tx_front), r32(sram + tx_rear), r32(sram + rx_front), r32(sram + rx_rear),
++			    r32(mbox + INTSR1), r32(sram + rx_base), r32(sram + rx_base + 4));
++			return -2;
++		}
++		delay(10);
++	}
++}
++
++/* Boot-core clock in MHz: PMU cycles over 50 ms. */
++static uint32_t
++cpu_mhz(void)
++{
++	uint64_t pmcr, c0, c1, t0, lim;
++	__asm__ volatile ("mrs %0, pmcr_el0" : "=r"(pmcr));
++	__asm__ volatile ("msr pmcr_el0, %0" :: "r"(pmcr | 1));
++	__asm__ volatile ("msr pmcntenset_el0, %0" :: "r"(1UL << 31));
++	__asm__ volatile ("isb");
++	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &lim);
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	t0 = mach_absolute_time();
++	__asm__ volatile ("mrs %0, pmccntr_el0" : "=r"(c0));
++	while (mach_absolute_time() - t0 < lim) {
++	}
++	__asm__ volatile ("mrs %0, pmccntr_el0" : "=r"(c1));
++	ml_set_interrupts_enabled(istate);
++	return (uint32_t)((c1 - c0) / 50000);
++}
++
++void
++y2s_acpm_init(void)
++{
++	uint32_t want = 2002000;
++	(void)PE_parse_boot_argn("y2scpukhz", &want, sizeof(want));
++	printf("Y2S ACPM: cpu %u MHz before\n", cpu_mhz());
++	if (want == 0) {
++		return;
++	}
++	mbox = ml_io_map(ACPM_MBOX_PA, 0x1000);
++	sram = ml_io_map(ACPM_SRAM_PA, ACPM_SRAM_SIZE);
++	/* struct acpm_framework (u32 fields): ipc_channels @0x8, ipc_ap_max @0x18 */
++	uint32_t chans = r32(sram + ACPM_INITDATA + 0x8);
++	uint32_t ap_max = r32(sram + ACPM_INITDATA + 0x18);
++	if (chans == 0 || chans >= ACPM_SRAM_SIZE || ap_max <= DVFS_CH || ap_max > 32) {
++		printf("Y2S ACPM: bad init data (channels 0x%x, ap_max %u)\n", chans, ap_max);
++		return;
++	}
++	/* struct ipc_channel: id, field, owner, type, channel_info (13 words), ap_poll = 72 bytes */
++	vm_offset_t c = sram + chans + 72 * DVFS_CH;
++	ch_id = r32(c + 0);
++	vm_offset_t ci = c + 16;
++	tx_rear = r32(ci + 0);
++	tx_front = r32(ci + 4);
++	tx_base = r32(ci + 8);
++	rx_rear = r32(ci + 24);
++	rx_front = r32(ci + 28);
++	rx_base = r32(ci + 32);
++	q_len = r32(ci + 36);
++	q_size = r32(ci + 40);
++	printf("Y2S ACPM: ch %u id %u len %u size %u tx %x/%x/%x rx %x/%x/%x poll %u\n",
++	    DVFS_CH, ch_id, q_len, q_size, tx_rear, tx_front, tx_base, rx_rear, rx_front, rx_base,
++	    r32(c + 68));
++	for (unsigned k = 0; k < ap_max && k < 12; k++) {
++		vm_offset_t ck = sram + chans + 72 * k;
++		printf("Y2S ACPM: ch%u id %u type %u len %u size %u poll %u\n", k, r32(ck), r32(ck + 12),
++		    r32(ck + 16 + 36), r32(ck + 16 + 40), r32(ck + 68));
++	}
++	if (q_len == 0 || q_len > 64 || q_size < 16 || q_size > 64 || ch_id > 15 ||
++	    tx_base >= ACPM_SRAM_SIZE || rx_base >= ACPM_SRAM_SIZE) {
++		printf("Y2S ACPM: channel layout looks wrong, not sending\n");
++		return;
++	}
++
++	uint32_t cmd[4] = { DVFS_CPUCL0, 0, FREQ_GET, 0 };
++	int r = acpm_xfer(cmd);
++	printf("Y2S ACPM: get cl0 rc %d -> %u kHz (0x%x 0x%x 0x%x)\n", r, cmd[1], cmd[0], cmd[2], cmd[3]);
++	if (r != 0 || cmd[1] < 100000 || cmd[1] > 3000000) {
++		printf("Y2S ACPM: no sane answer, not changing the clock\n");
++		return;
++	}
++	uint32_t set[4] = { DVFS_CPUCL0, want, FREQ_REQ, 0 };
++	r = acpm_xfer(set);
++	printf("Y2S ACPM: set cl0 %u kHz rc %d (0x%x 0x%x 0x%x 0x%x)\n", want, r, set[0], set[1], set[2], set[3]);
++	uint32_t get2[4] = { DVFS_CPUCL0, 0, FREQ_GET, 0 };
++	r = acpm_xfer(get2);
++	printf("Y2S ACPM: cl0 now %u kHz (rc %d), cpu %u MHz measured\n", get2[1], r, cpu_mhz());
++}
++#endif /* ARM64_BOARD_CONFIG_Y2S */
+diff --git a/bsd/dev/y2s_ufs.c b/bsd/dev/y2s_ufs.c
+index f1efb0f..bc213e9 100644
+--- a/bsd/dev/y2s_ufs.c
++++ b/bsd/dev/y2s_ufs.c
+@@ -62,6 +62,7 @@ extern void y2s_sample_start(void);
+ extern void y2s_keys_init(void);
+ extern void y2s_touch_init(void);
+ extern void y2s_sects_init(void);
++extern void y2s_acpm_init(void);
+ extern void y2s_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -862,6 +863,7 @@ y2s_ufs_init(void)
+ 		y2s_touch_init();
+ 		y2s_usb_probe();
+ 	} else {
++		y2s_acpm_init();        /* Galaxy S20+ boot cluster clock via ACPM */
+ 		y2s_sects_init();       /* Galaxy S20+ sec_ts */
+ 	}
+ 	return 0;

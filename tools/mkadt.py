@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Build the minimal Apple Device Tree that the Y2S xnu needs to boot on the
+Galaxy S20+ (y2s, SM-G986B, Exynos 990).
+
+Every address comes from the phone's live device tree (~/ios-s20/live.dts,
+taken from the running stock kernel). Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--lowmem]
+
+--qemu: the same tree for QEMU virt (tools/qemu-y2s.py): same RAM and
+framebuffer addresses, but QEMU's GICv2 (-M virt,gic-version=2) and CNTFRQ.
+"""
+import hashlib, os, struct, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import adt  # noqa: E402
+
+# Kernel-managed RAM. live.dts /memory: 0x80000000-0xbab00000 is the low bank
+# up to el3mon_reserve (0xbab00000). Below 0x9a000000 are the shim
+# (0x80080000), the boot.img ramdisk = our payload (/chosen linux,initrd-start
+# 0x88080000), sec_debug_next (0x91200000 +16M) and the static secure_camera
+# carve-out (0x96000000-0x99200000). 512 MiB, 32 MiB aligned (one L2 block).
+PHYS_BASE = 0x9a000000
+MEM_SIZE = 0x20000000
+# Phone default: 4 GiB in the high DDR bank (live.dts memory 0x8_8000_0000 -
+# 0xa_ffff_ffff, contiguous). Static carve-outs there: sec_rdx_bootdev
+# 0x8_8000_0000 +0xad00000 (below) and el2_earlymem 0xa_fe80_0000 (above).
+# The UFS host cannot DMA at or above 0xa_0000_0000 (Samsung's ufshcd.c
+# bounces those: DMA_UPPER_ADDR), so the RAM stays below it. 32 MiB aligned.
+# --lowmem keeps the 512 MiB low-bank layout above (also used for --qemu).
+HIGH_PHYS_BASE = 0x88c000000
+HIGH_MEM_SIZE = 0x100000000
+# /arm-io children are relative to this; it must not be 0 (serial_init bails)
+SOC_BASE = 0x01000000
+
+# S-Boot's framebuffer (bootargs s3cfb.bootloaderfb=0xf1000000), 1440x3200
+# a8r8g8b8; xnu patch 0083 (Y2S_FB_* in pexpert/arm64/Y2S.h) must match.
+FB, FB_W, FB_H = 0xf1000000, 1440, 3200
+FB_STRIDE = FB_W * 4
+FB_SIZE = FB_STRIDE * FB_H
+Y2S_ECID = 0x5932530000000001  # 'Y2S' + 1, synthetic
+# live.dts: timer clock-frequency = <0x18cba80> (26 MHz); virtual timer
+# <GIC_PPI 11> = INTID 27; interrupt-controller@10100000 "arm,cortex-a15-gic":
+# GICD 0x10101000, GICC 0x10102000 (GIC-400: the CPU interface is 8K).
+TIMEBASE = 26000000
+VTIMER_INTID = 27
+GICD, GICC = 0x10101000, 0x10102000
+GICD_SIZE, GICC_SIZE = 0x1000, 0x2000
+# UFS: live.dts reg = <0x13100000 0x200>, <0x13101100 0x200> (HCI, vendor HCI), ...
+UFS_HCI, UFS_VS_HCI = 0x13100000, 0x13101100
+# QEMU virt -M virt,gic-version=2: GICD 0x08000000, GICC 0x08010000; CNTFRQ 62.5 MHz
+QEMU_GICD, QEMU_GICC, QEMU_TIMEBASE, QEMU_VTIMER_INTID = 0x08000000, 0x08010000, 62500000, 27
+
+BOOT_MANIFEST_HASH = hashlib.sha384(b'y2s boot manifest').digest()
+
+# The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
+# derives product type, device class, home-button-less UI, artwork etc. from
+# the root identity and /product of the real D22AP device tree. That tree is
+# an Apple artifact (kept out of git): extract it from the IPSW with
+#   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
+#   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
+D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+
+
+def d22ap_product(path=D22AP_ADT):
+    """/product properties of the real D22AP tree, without the syscfg
+    placeholders iBoot would fill in (flag bit set) and the node bookkeeping."""
+    if not os.path.exists(path):
+        print(f'warning: {path} missing, no /product node', file=sys.stderr)
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+    raise SystemExit(f'{path}: no /product node')
+
+u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
+u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
+cstr = lambda s: s.encode() + b'\0'
+
+
+def node(name, props=(), children=()):
+    n = adt.Node()
+    n.props = [('name', 0, cstr(name))] + [(k, 0, v) for k, v in props]
+    n.children = list(children)
+    return n
+
+
+def build(seed=None, qemu=False, lowmem=False):
+    """qemu=True: same tree, but with QEMU virt's GICv2 and CNTFRQ (tools/qemu-y2s.py)."""
+    phys_base, mem_size = (PHYS_BASE, MEM_SIZE) if (qemu or lowmem) else (HIGH_PHYS_BASE, HIGH_MEM_SIZE)
+    gicd, gicc, timebase = (QEMU_GICD, QEMU_GICC, QEMU_TIMEBASE) if qemu else (GICD, GICC, TIMEBASE)
+    vtimer = QEMU_VTIMER_INTID if qemu else VTIMER_INTID
+    seed = seed if seed is not None else os.urandom(64)
+    phandle = iter(range(1, 1000))
+    ph = lambda: ('AAPL,phandle', u32(next(phandle)))
+
+    chosen = node('chosen', [
+        ph(),
+        ('dram-base', u64(phys_base)),
+        ('dram-size', u64(mem_size)),
+        ('random-seed', seed),
+        ('debug-enabled', u32(1)),
+        ('firmware-version', cstr('y2s-shim')),
+        ('system-firmware-version', cstr('y2s-shim')),
+        ('boot-manifest-hash', BOOT_MANIFEST_HASH),
+        ('crypto-hash-method', cstr('sha2-384')),
+        ('display-scale', u32(3)),
+        ('unique-chip-id', struct.pack('<Q', Y2S_ECID)),
+        ('chip-id', u32(0x8015)),
+        ('certificate-production-status', u32(0)),
+        ('effective-production-status-ap', u32(0)),
+        ('certificate-security-mode', u32(1)),
+        ('effective-security-mode-sep', u32(1)),
+    ], [node('memory-map', [ph()]),
+        node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
+
+    # live.dts /cpus: cpu@0000-0003 "arm,ananke" (Cortex-A55), cpu@0004-0005
+    # "arm,enyo" (Cortex-A76), cpu@0100-0101 "arm,lion" (Samsung M5, left out
+    # until their 16K-granule support is checked). reg = MPIDR. Boot-arg
+    # cpus=N starts the first N (cpu0 = MPIDR 0, the boot CPU). QEMU: 1 CPU.
+    cores = [(0x000, 2002000000), (0x001, 2002000000), (0x002, 2002000000), (0x003, 2002000000),
+             (0x004, 2504000000), (0x005, 2504000000)]
+    cpu_nodes = []
+    for i, (mpidr, hz) in enumerate(cores[:1] if qemu else cores):
+        cpu_nodes.append(node(f'cpu{i}', [
+            ph(),
+            ('device_type', cstr('cpu')),
+            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),  # Y2SCPU matches this
+            ('reg', u32(mpidr)),
+            ('cpu-id', u32(i)),
+            ('cluster-id', u32(0)),
+            ('cluster-type', u32(0)),    # homogeneous CLUSTER_TYPE_SMP
+            ('die-cluster-id', u32(0)),
+            ('cluster-core-id', u32(i)),
+            ('l2-cache-id', u32(i)),
+            ('l3-cache-id', u32(0)),
+            ('state', cstr('running' if i == 0 else 'stopped')),
+            ('timebase-frequency', u32(timebase)),
+            ('clock-frequency', u32(hz)),
+            ('bus-frequency', u32(100000000)),
+            ('memory-frequency', u32(2750000000)),
+            ('peripheral-frequency', u32(timebase)),
+            ('fixed-frequency', u32(timebase)),
+        ]))
+    cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
+                         ('#size-cells', u32(0))], cpu_nodes)
+
+    gic = node('gic', [
+        ph(),
+        ('compatible', cstr('arm,gic-400') + cstr('arm,cortex-a15-gic')),
+        ('interrupt-controller', b''),
+        ('virtual-timer-intid', u32(vtimer)),
+        ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicc - SOC_BASE, GICC_SIZE)),
+    ])
+    arm_io = node('arm-io', [
+        ph(),
+        ('device_type', cstr('y2s-io')),
+        ('compatible', cstr('y2s-io') + cstr('arm-io')),
+        ('#address-cells', u32(2)),
+        ('#size-cells', u32(2)),
+        ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
+    ], [gic,
+        # No hardware: watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
+        # otherwise crashes trying to set the PMU boot stage (customer builds
+        # ignore the -wdt_no_pmu boot-arg).
+        node('wdt', [ph(), ('no-pmu', u32(1))]),
+        # Main display: IOMobileFramebuffer.framework counts /arm-io children
+        # with this device_type and reads the canvas size from the node
+        # (the presented iPhone X size, see Y2SFramebuffer.cpp);
+        # the kernel's AppleCLCD matches the compatible string.
+        node('disp0', [
+            ph(),
+            ('device_type', cstr('display-subsystem')),
+            ('compatible', cstr('y2s,display')),
+            ('canvas-width', u32(1125)),
+            ('canvas-height', u32(2436)),
+        ])])
+
+    fbcon = node('y2s-fbcon', [
+        ph(),
+        ('reg', u64(FB, FB_SIZE)),
+        ('width', u32(FB_W)),
+        ('height', u32(FB_H)),
+        ('stride', u32(FB_STRIDE)),
+    ])
+
+    # Internal UFS (live.dts ufs@0x13100000 "samsung,exynos-ufs"): HCI and
+    # the vendor HCI block. Absolute addresses (not under /arm-io). The
+    # driver (xnu patch 0084) only starts for rd=ufsroot0.
+    ufs = node('y2s-ufs', [
+        ph(),
+        ('compatible', cstr('samsung,exynos-ufs')),
+        ('reg', u64(UFS_HCI, 0x200, UFS_VS_HCI, 0x200)),
+    ])
+
+    defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
+
+    # MobileGestalt HomeButtonType = IODeviceTree:/buttons home-button-type
+    # (D22AP: 2, no Home button; absent = 0 = Home-button device).
+    buttons = node('buttons', [
+        ph(),
+        ('button-names', cstr('volup') + cstr('voldown') + cstr('hold')),
+        ('home-button-type', u32(2)),
+        ('opposed-power-vol-buttons', u32(1)),
+    ])
+
+    product_props = d22ap_product()
+    product = [node('product', [ph()] + product_props)] if product_props else []
+
+    # Identity of the iPhone X whose userland runs here: compatible[0] is
+    # hw.model/hw.target (D22AP), model is hw.machine/hw.product
+    # (iPhone10,3). 'samsung,y2s' is what Y2SPlatformExpert matches.
+    return node('device-tree', [
+        ph(),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('samsung,y2s') + cstr('samsung,exynos990') + cstr('AppleARM')),
+        ('model', cstr('iPhone10,3')),
+        ('target-type', cstr('D22')),
+        ('target-sub-type', cstr('D22AP')),
+        ('manufacturer', cstr('Apple Inc.')),
+        ('#address-cells', u32(2)),
+        ('#size-cells', u32(2)),
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+
+
+if __name__ == '__main__':
+    root = build(qemu='--qemu' in sys.argv, lowmem='--lowmem' in sys.argv)
+    blob = adt.serialize(root)
+    open(sys.argv[1], 'wb').write(blob)
+    if '--dump' in sys.argv:
+        adt.dump(adt.parse(blob)[0])
+    print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)
