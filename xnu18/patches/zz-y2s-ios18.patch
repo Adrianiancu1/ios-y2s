@@ -2481,10 +2481,10 @@ index 0000000..f2bb196
 +#endif /* ARM64_BOARD_CONFIG_Y2S */
 diff --git a/bsd/dev/y2s_ufs.c b/bsd/dev/y2s_ufs.c
 new file mode 100644
-index 0000000..bc213e9
+index 0000000..f291a3b
 --- /dev/null
 +++ b/bsd/dev/y2s_ufs.c
-@@ -0,0 +1,1029 @@
+@@ -0,0 +1,1030 @@
 +/*
 + * Y2S internal UFS root device.
 + *
@@ -2516,6 +2516,7 @@ index 0000000..bc213e9
 + */
 +#if defined(ARM64_BOARD_CONFIG_Y2S)
 +#include <sys/param.h>
++#include <vm/vm_kern_xnu.h>
 +#include <sys/systm.h>
 +#include <sys/buf.h>
 +#include <sys/conf.h>
@@ -3516,10 +3517,10 @@ index 0000000..bc213e9
 +#endif /* ARM64_BOARD_CONFIG_Y2S */
 diff --git a/bsd/dev/y2s_usb.c b/bsd/dev/y2s_usb.c
 new file mode 100644
-index 0000000..e822f94
+index 0000000..52af3a4
 --- /dev/null
 +++ b/bsd/dev/y2s_usb.c
-@@ -0,0 +1,931 @@
+@@ -0,0 +1,932 @@
 +/*
 + * Y2S: USB bring-up, step 1 - read-only state probe.
 + *
@@ -3534,6 +3535,7 @@ index 0000000..e822f94
 + */
 +#if defined(ARM64_BOARD_CONFIG_Y2S)
 +#include <sys/param.h>
++#include <vm/vm_kern_xnu.h>
 +#include <sys/systm.h>
 +#include <kern/clock.h>
 +#include <kern/thread.h>
@@ -5564,39 +5566,41 @@ index e9170fd..8cb1fcf 100644
  options		DEVFS		# devfs support			# <devfs>
 diff --git a/config/MASTER.arm64.y2s b/config/MASTER.arm64.y2s
 new file mode 100644
-index 0000000..3744d59
+index 0000000..ba2e161
 --- /dev/null
 +++ b/config/MASTER.arm64.y2s
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,135 @@
 +#
-+# y2s (Redmi Note 10 Pro, SM7150): MASTER.arm64.MacOSX plus the open-source
-+# arm64 assembly and pmap (nos_arm_asm, nos_arm_pmap). Apple's own SoC configs
-+# link those from the KDK's closed lib<SOC>.os.<CONFIG>.a instead, which is
-+# arm64e and Apple-silicon specific. kperf/kpc stay (xnu does not build without
-+# kperf); osfmk/arm64/kpc.c is a stub with no hardware counters.
 +#
++# y2s (Galaxy S20+, Exynos 990): MASTER.arm64.MacOSX (xnu-11417) plus the
++# open-source arm64 assembly and pmap (nos_arm_asm, nos_arm_pmap) instead of
++# ARM_EXTRAS_BASE (SPTM / closed PPL libs), built-in HFS (y2s_hfs), mockfs,
++# bindfs, and no config_ext_resolver.
 +#
 +# Mach Operating System
 +# Copyright (c) 1986 Carnegie-Mellon University
-+# Copyright 2001-2018 Apple Inc.
++# Copyright 2001-2024 Apple Inc.
 +#
 +# All rights reserved.  The CMU software License Agreement
 +# specifies the terms and conditions for use and redistribution.
-+#  
 +######################################################################
 +#
 +#  Master Apple configuration file (see the master machine independent
 +#  configuration file for a description of the file format).
 +#
 +######################################################################
-+#  
 +#  Standard Apple OS Configurations:
 +#  -------- ----- -- ---------------
 +#
-+#  KERNEL_BASE =    [ arm64 config_pmap_ppl medium msgb_large config_requires_u32_munging config_delay_idle_sleep config_proc_udata_storage config_uexc config_darkboot nos_arm_asm nos_arm_pmap ]
++#if MASTER_CONFIG_ENABLE_SPTM
++#  ARM_EXTRAS_BASE = [ config_sptm config_sptm_iommu ]
++#else
++#  ARM_EXTRAS_BASE = [ config_pmap_ppl ]
++#endif
++#  KERNEL_BASE =    [ arm64 medium msgb_large config_requires_u32_munging config_delay_idle_sleep config_proc_udata_storage config_uexc config_darkboot config_pmap_ppl nos_arm_asm nos_arm_pmap ]
 +#  KERNEL_RELEASE = [ KERNEL_BASE ]
-+#  KERNEL_DEV =     [ KERNEL_BASE development mach_assert config_xnupost proc_ref_debug config_proc_resource_limits ]
-+#  KERNEL_DEBUG =   [ KERNEL_BASE debug mach_assert config_xnupost config_waitq_stats config_workloop_debug config_proc_resource_limits ]
++#  KERNEL_DEV =     [ KERNEL_BASE development mach_assert config_xnupost proc_ref_debug config_proc_resource_limits config_ext_paniclog ]
++#  KERNEL_DEBUG =   [ KERNEL_BASE debug mach_assert config_xnupost config_waitq_stats config_workloop_debug config_proc_resource_limits config_ext_paniclog ]
 +#  BSD_BASE =       [ mach_bsd sysv_sem sysv_msg sysv_shm config_netboot config_imageboot psynch config_proc_uuid_policy config_coredump pgo config_personas ]
 +#  BSD_RELEASE =    [ BSD_BASE ]
 +#  BSD_DEV =        [ BSD_BASE config_vnguard ]
@@ -5610,9 +5614,9 @@ index 0000000..3744d59
 +#  SKYWALK_RELEASE = [ SKYWALK_BASE ]
 +#  SKYWALK_DEV =    [ SKYWALK_BASE ]
 +#  SKYWALK_DEBUG =  [ SKYWALK_BASE ]
-+#  NETWORKING =     [ inet bpfilter dummynet traffic_mgt sendfile ah_all_crypto bond vlan gif stf ifnet_input_chk config_mbuf_jumbo if_bridge MULTIPATH if_fake remote_vif ]
++#  NETWORKING =     [ inet bpfilter dummynet traffic_mgt sendfile ah_all_crypto bond vlan gif stf ifnet_input_chk config_mbuf_jumbo if_bridge MULTIPATH if_fake if_redirect remote_vif ]
 +#  NETWORKING_RELEASE = [ NETWORKING ]
-+#  NETWORKING_DEV = [ NETWORKING_RELEASE packet_mangler if_headless ]
++#  NETWORKING_DEV = [ NETWORKING_RELEASE packet_mangler if_headless kctl_test ]
 +#  NETWORKING_DEBUG = [ NETWORKING_DEV ]
 +#  VPN =            [ ipsec flow_divert necp content_filter ]
 +#  PF =             [ pf pflog ]
@@ -5630,10 +5634,16 @@ index 0000000..3744d59
 +#  LIBKERN_RELEASE =[ LIBKERN_BASE zlib ]
 +#  LIBKERN_DEV =    [ LIBKERN_BASE zlib iotracking ]
 +#  LIBKERN_DEBUG =  [ LIBKERN_BASE zlib iotracking ]
-+#  PERF_DBG_BASE =  [ config_dtrace mach_kdp config_serial_kdp kdp_interactive_debugging config_kdp_coredump_encryption config_pervasive_energy PERFMON_BASE kperf kpc ]
++#if SOC_IS_VIRTUALIZED
++#  CPU_COUNTERS_BASE = [ ]
++#else /*!SOC_IS_VIRTUALIZED*/
++#  CPU_COUNTERS_BASE = [ config_cpu_counters config_pervasive_cpi config_pervasive_energy ]
++#endif /*SOC_IS_VIRTUALIZED*/
++#  PERF_DBG_BASE =  [ config_dtrace mach_kdp config_serial_kdp kdp_interactive_debugging config_kdp_coredump_encryption CPU_COUNTERS_BASE kperf ]
 +#  PERF_DBG_RELEASE=[ PERF_DBG_BASE ist_kdebug ]
 +#  PERF_DBG_DEV =   [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace ]
 +#  PERF_DBG_DEBUG = [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace ]
++#  PERF_DBG_KASAN = [ PERF_DBG_BASE lock_stats zleaks alternate_debugger config_debug_syscall_rejection config_iotrace ]
 +#if SOC_IS_VIRTUALIZED
 +#  PARAVIRT_BASE =  [ config_pv_ticket ]
 +#else
@@ -5641,23 +5651,34 @@ index 0000000..3744d59
 +#endif /*SOC_IS_VIRTUALIZED*/
 +#  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_arm_pfz config_user_notification phys_write_acct config_service_port_info config_voucher_deprecated PARAVIRT_BASE config_ledger_interval_max ]
 +#  MACH_RELEASE =   [ MACH_BASE ]
-+#  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace ]
-+#  MACH_DEBUG =     [ MACH_BASE config_io_accounting importance_trace importance_debug ]
-+#  SCHED_BASE =     [ config_sched_traditional config_sched_multiq config_sched_deferred_ast config_clutch config_sched_sfi config_sched_auto_join config_preadopt_tg ]
++#  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace config_task_suspend_stats ]
++#  MACH_DEBUG =     [ MACH_BASE config_io_accounting importance_trace importance_debug config_task_suspend_stats ]
++#  SCHED_BASE =     [ config_sched_timeshare_core config_sched_deferred_ast config_clutch config_sched_sfi config_sched_auto_join config_preadopt_tg ]
 +#  SCHED_RELEASE =  [ SCHED_BASE ]
 +#  SCHED_DEV =      [ SCHED_BASE ]
-+#  SCHED_DEBUG =    [ SCHED_BASE config_sched_grrr config_sched_proto ]
-+#  VM_BASE =        [ vm_pressure_events memorystatus config_code_decryption encrypted_swap config_deferred_reclaim ]
++#  SCHED_DEBUG =    [ SCHED_BASE ]
++#if   MASTER_CONFIG_ENABLE_SPTM
++#  VM_EXTRA =       [ ]
++#  VM_EXTRA_DEV =   [ ]
++#else
++#  VM_EXTRA =       [ ]
++#  VM_EXTRA_DEV =   [ pgzalloc ]
++#endif /* MASTER_CONFIG_ENABLE_KERNEL_TAG && MASTER_CONFIG_ENABLE_SPTM */
++#  VM_BASE =        [ vm_pressure_events memorystatus config_code_decryption encrypted_swap config_deferred_reclaim VM_EXTRA ]
 +#  VM_RELEASE =     [ VM_BASE ]
-+#  VM_DEV =         [ VM_BASE dynamic_codesigning pgzalloc ]
-+#  VM_DEBUG =       [ VM_BASE dynamic_codesigning pgzalloc ]
-+#  VM_KASAN =       [ VM_BASE dynamic_codesigning config_kasan config_ubsan config_kcov config_ksancov kernel_tbi ]
-+#  SECURITY =       [ config_macf config_audit kernel_integrity config_csr config_csr_from_dt config_setuid config_kas_info config_secure_bsd_root config_arcade config_supplemental_signatures second_static_trust_cache reslide_shared_cache ]
-+#  BASE =           [ PF VPN SECURITY NFS ]
-+#  RELEASE =        [ BASE KERNEL_RELEASE BSD_RELEASE FILESYS_RELEASE SKYWALK_RELEASE NETWORKING_RELEASE IOKIT_RELEASE LIBKERN_RELEASE    PERF_DBG_RELEASE MACH_RELEASE SCHED_RELEASE VM_RELEASE ]
-+#  DEVELOPMENT =    [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     ]
-+#  DEBUG =          [ BASE KERNEL_DEBUG   BSD_DEBUG   FILESYS_DEBUG   SKYWALK_DEBUG   NETWORKING_DEBUG   IOKIT_DEBUG   LIBKERN_DEBUG      PERF_DBG_DEBUG   MACH_DEBUG   SCHED_DEBUG   VM_DEBUG   ]
-+#  KASAN =          [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_KASAN   ]
++#  VM_DEV =         [ VM_BASE dynamic_codesigning VM_EXTRA_DEV ]
++#  VM_DEBUG =       [ VM_BASE dynamic_codesigning VM_EXTRA_DEV ]
++#  VM_KASAN =       [ VM_BASE dynamic_codesigning config_kasan config_ubsan config_kcov config_ksancov kernel_tagging kernel_tbi ]
++#  SECURITY_BASE  =   [ config_macf config_audit kernel_integrity config_csr config_csr_from_dt config_setuid config_kas_info config_secure_bsd_root config_arcade config_supplemental_signatures second_static_trust_cache reslide_shared_cache ]
++#  SECURITY_RELEASE = [ SECURITY_BASE ]
++#  SECURITY_DEV   =   [ SECURITY_BASE ]
++#  SECURITY_DEBUG =   [ SECURITY_BASE ]
++#  BASE =           [ PF VPN NFS ]
++#  RELEASE =        [ BASE KERNEL_RELEASE BSD_RELEASE FILESYS_RELEASE SKYWALK_RELEASE NETWORKING_RELEASE IOKIT_RELEASE LIBKERN_RELEASE    PERF_DBG_RELEASE MACH_RELEASE SCHED_RELEASE VM_RELEASE SECURITY_RELEASE ]
++#  DEVELOPMENT =    [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     SECURITY_DEV     ]
++#  DEBUG =          [ BASE KERNEL_DEBUG   BSD_DEBUG   FILESYS_DEBUG   SKYWALK_DEBUG   NETWORKING_DEBUG   IOKIT_DEBUG   LIBKERN_DEBUG      PERF_DBG_DEBUG   MACH_DEBUG   SCHED_DEBUG   VM_DEBUG   SECURITY_DEBUG   ]
++#  KASAN =          [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_KASAN   MACH_DEV     SCHED_DEV     VM_KASAN   SECURITY_DEV     ]
++#  SPTM =           [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     SECURITY_DEV     ]
 +#
 +######################################################################
 +#
@@ -5683,6 +5704,7 @@ index 0000000..3744d59
 +
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
++options   CONFIG_KERNEL_TAGGING		# <kernel_tagging>
 diff --git a/config/Private.arm64.exports b/config/Private.arm64.exports
 index 126605f..635ebba 100644
 --- a/config/Private.arm64.exports
@@ -32117,15 +32139,17 @@ index 331291b..c8028b6 100644
  	read_lbr();
  #endif
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 7b3c26a..9cfccae 100644
+index 7b3c26a..1bc7665 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -965,6 +965,228 @@ exception_triage(
+@@ -965,6 +965,230 @@ exception_triage(
  	return exception_triage_thread(exception, code, codeCnt, thread);
  }
  
 +#if defined(ARM64_BOARD_CONFIG_Y2S)
 +#include <vm/vm_shared_region.h>
++#include <vm/vm_shared_region_xnu.h>
++#include <vm/vm_map_internal.h>
 +#include <arm/thread.h>
 +
 +/*
@@ -32349,60 +32373,6 @@ index 7b3c26a..9cfccae 100644
  kern_return_t
  bsd_exception(
  	exception_type_t        exception,
-diff --git a/osfmk/prng/entropy.c b/osfmk/prng/entropy.c
-index d999eb8..408d2e4 100644
---- a/osfmk/prng/entropy.c
-+++ b/osfmk/prng/entropy.c
-@@ -40,6 +40,10 @@
- #include <machine/machine_routines.h>
- #include <libkern/section_keywords.h>
- #include <sys/cdefs.h>
-+#if defined(Y2S)
-+#include <corecrypto/ccdigest.h>
-+#include <corecrypto/ccsha2.h>
-+#endif
- 
- // The number of samples we can hold in an entropy buffer.
- #define ENTROPY_MAX_SAMPLE_COUNT (2048)
-@@ -469,6 +473,38 @@ entropy_health_test(uint32_t sample_count, entropy_sample_t *samples, __assert_o
- 	return result;
- }
- 
-+/* Y2S uses the same built-in digest as early_random, without a kext. */
-+static void
-+entropy_hash_init(void)
-+{
-+#if defined(Y2S)
-+	ccdigest_init(&ccsha256_ltc_di, entropy_data.sha256_ctx);
-+#else
-+	SHA256_Init(&entropy_data.sha256_ctx);
-+#endif
-+}
-+
-+static void
-+entropy_hash_update(const void *data, size_t nbytes)
-+{
-+#if defined(Y2S)
-+	ccdigest_update(&ccsha256_ltc_di, entropy_data.sha256_ctx, nbytes, data);
-+#else
-+	SHA256_Update(&entropy_data.sha256_ctx, data, nbytes);
-+#endif
-+}
-+
-+static void
-+entropy_hash_final(void *out)
-+{
-+#if defined(Y2S)
-+	ccdigest_final(&ccsha256_ltc_di, entropy_data.sha256_ctx, out);
-+	ccdigest_ctx_clear(CCSHA256_STATE_SIZE, CCSHA256_BLOCK_SIZE, entropy_data.sha256_ctx);
-+#else
-+	SHA256_Final(out, &entropy_data.sha256_ctx);
-+#endif
-+}
-+
- int32_t
- entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
- {
 diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
 index f51b4b0..0924433 100644
 --- a/osfmk/prng/prng_random.c
@@ -33258,10 +33228,10 @@ index 5afac02..78a21fb 100644
  # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
 diff --git a/pexpert/pexpert/arm64/Y2S.h b/pexpert/pexpert/arm64/Y2S.h
 new file mode 100644
-index 0000000..5c389bb
+index 0000000..2ac5714
 --- /dev/null
 +++ b/pexpert/pexpert/arm64/Y2S.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,138 @@
 +/*
 + * Board config for the Redmi Note 10 Pro ("y2s", Qualcomm SM7150 /
 + * Snapdragon 732G): Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
@@ -33301,6 +33271,17 @@ index 0000000..5c389bb
 +#define __ARM_16K_PG__            1
 +
 +#define HAS_GIC_V3                1
++
++/*
++ * xnu-11417 includes apple_arm64_cpu.h unconditionally; it reads the Apple
++ * core type from MPIDR (definitions as in apple_arm64_regs.h). On Exynos
++ * those bits are Aff2 = 0, i.e. every core reports as E-core.
++ */
++#define MPIDR_CORETYPE_SHIFT  (16)
++#define MPIDR_CORETYPE_WIDTH  (3)
++#define MPIDR_CORETYPE_MASK   ((1ULL << MPIDR_CORETYPE_WIDTH) - 1)
++#define MPIDR_CORETYPE_ACC_E  (0ULL)
++#define MPIDR_CORETYPE_ACC_P  (1ULL)
 +
 +#ifndef ASSEMBLER
 +#define PLATFORM_PANIC_LOG_DISABLED
