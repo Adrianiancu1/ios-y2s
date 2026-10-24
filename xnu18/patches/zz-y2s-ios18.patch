@@ -31289,6 +31289,28 @@ index 0000000..c92c202
 +#include <stdint.h>
 +
 +static const uint8_t y2s_no_amcc_rorgn __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/amcc_rorgn_ppl_amcc.c b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+new file mode 100644
+index 0000000..3984ee6
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+@@ -0,0 +1,5 @@
++/*
++ * Y2S: Apple AMCC/CTRR read-only region hardware does not exist on Exynos.
++ * xnu-11417 lists this closed-source file for nos_arm_asm + config_pmap_ppl;
++ * the needed entry points are stubbed in amcc_rorgn_ppl.c.
++ */
+diff --git a/osfmk/arm64/amcc_rorgn_ppl_ctrr3.c b/osfmk/arm64/amcc_rorgn_ppl_ctrr3.c
+new file mode 100644
+index 0000000..3984ee6
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_ppl_ctrr3.c
+@@ -0,0 +1,5 @@
++/*
++ * Y2S: Apple AMCC/CTRR read-only region hardware does not exist on Exynos.
++ * xnu-11417 lists this closed-source file for nos_arm_asm + config_pmap_ppl;
++ * the needed entry points are stubbed in amcc_rorgn_ppl.c.
++ */
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 index e050e53..0c05056 100644
 --- a/osfmk/arm64/arm_vm_init.c
