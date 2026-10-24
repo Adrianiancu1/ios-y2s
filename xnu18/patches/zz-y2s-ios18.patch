@@ -31661,7 +31661,7 @@ index d4e10cd..47572c2 100644
  
  /* I-Cache. */
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 77e126f..2daaa72 100644
+index 77e126f..4942e8a 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -32,6 +32,7 @@
@@ -31672,7 +31672,7 @@ index 77e126f..2daaa72 100644
  #include <arm/trap_internal.h> /* for IS_ARM_GDB_TRAP() et al */
  #include <arm64/proc_reg.h>
  #include <arm64/machine_machdep.h>
-@@ -2099,6 +2100,17 @@ handle_kernel_abort(arm_saved_state_t *state, uint64_t esr, vm_offset_t fault_ad
+@@ -2099,6 +2100,24 @@ handle_kernel_abort(arm_saved_state_t *state, uint64_t esr, vm_offset_t fault_ad
  	(void)expected_fault_handler;
  #endif /* CONFIG_XNUPOST */
  
@@ -31681,8 +31681,15 @@ index 77e126f..2daaa72 100644
 +	 * stack is gone; report the first one instead. */
 +	{
 +		if (kernel_map == VM_MAP_NULL) {
-+			panic("Y2S early kernel abort: far 0x%lx esr 0x%llx pc 0x%llx lr 0x%llx",
-+			    (unsigned long)fault_addr, esr, get_saved_state_pc(state), get_saved_state_lr(state));
++			extern void y2s_fbcon_info(uint64_t *, uint64_t *, uint32_t *);
++			extern vm_offset_t virtual_space_start, virtual_space_end;
++			uint64_t fb, fbsz; uint32_t g[5];
++			y2s_fbcon_info(&fb, &fbsz, g);
++			panic("Y2S early kernel abort: far 0x%lx esr 0x%llx pc 0x%llx lr 0x%llx\n"
++			    "fbcon base 0x%llx size 0x%llx w %u h %u stride %u row %u/%u vss 0x%lx vse 0x%lx",
++			    (unsigned long)fault_addr, esr, get_saved_state_pc(state), get_saved_state_lr(state),
++			    fb, fbsz, g[0], g[1], g[2], g[3], g[4],
++			    (unsigned long)virtual_space_start, (unsigned long)virtual_space_end);
 +		}
 +	}
 +#endif
@@ -31690,7 +31697,7 @@ index 77e126f..2daaa72 100644
  #if CONFIG_DTRACE
  	if (is_vm_fault(fault_code) && thread->t_dtrace_inprobe) { /* Executing under dtrace_probe? */
  		if (dtrace_tally_fault(fault_addr)) { /* Should a fault under dtrace be ignored? */
-@@ -2518,6 +2530,42 @@ sleh_irq(arm_saved_state_t *state)
+@@ -2518,6 +2537,42 @@ sleh_irq(arm_saved_state_t *state)
  #endif
  
  
@@ -31733,7 +31740,7 @@ index 77e126f..2daaa72 100644
  	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
  
  #if USE_APPLEARMSMP
-@@ -2529,6 +2577,7 @@ sleh_irq(arm_saved_state_t *state)
+@@ -2529,6 +2584,7 @@ sleh_irq(arm_saved_state_t *state)
  	    cdp->interrupt_nub,
  	    cdp->interrupt_source);
  #endif
@@ -33072,7 +33079,7 @@ index 3ad743f..322c995 100644
  #else
  void
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index d0db827..7ff2106 100644
+index d0db827..6a6accb 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
 @@ -26,6 +26,7 @@
@@ -33083,7 +33090,7 @@ index d0db827..7ff2106 100644
  #include <pexpert/arm/protos.h>
  #include <kern/sched_prim.h>
  #ifdef PL011_UART
-@@ -751,6 +752,150 @@ static void uart_puts_force_poll_device(
+@@ -751,6 +752,161 @@ static void uart_puts_force_poll_device(
  	const char *str,
  	struct pe_serial_functions *fns);
  
@@ -33107,6 +33114,16 @@ index d0db827..7ff2106 100644
 +#define FBCON_BG        0xff000000u
 +
 +static volatile uint32_t *fbcon_base;
++static uint64_t fbcon_map_size;
++void y2s_fbcon_info(uint64_t *base, uint64_t *size, uint32_t *geo);
++void
++y2s_fbcon_info(uint64_t *base, uint64_t *size, uint32_t *geo)
++{
++	*base = (uint64_t)fbcon_base;
++	*size = fbcon_map_size;
++	geo[0] = fbcon_width; geo[1] = fbcon_height; geo[2] = fbcon_stride;
++	geo[3] = fbcon_row; geo[4] = fbcon_rows;
++}
 +static uint32_t fbcon_width, fbcon_height, fbcon_stride;
 +static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
 +
@@ -33225,6 +33242,7 @@ index d0db827..7ff2106 100644
 +	}
 +	y2s_early_mark(17, "fbcon config read; mapping");
 +	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
++	fbcon_map_size = reg[1];
 +	y2s_early_mark(18, "fbcon mapping returned");
 +	if (fbcon_base != NULL) {
 +		register_serial_functions(&y2s_fbcon_serial_functions);
@@ -33234,7 +33252,7 @@ index d0db827..7ff2106 100644
  #if HIBERNATION
  /**
   * Transitions the serial driver into a mode that can be run in the hibernation
-@@ -908,11 +1053,14 @@ serial_init(void)
+@@ -908,11 +1064,14 @@ serial_init(void)
  
  	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
  
