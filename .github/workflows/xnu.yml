@@ -106,6 +106,10 @@ jobs:
           errs += [l for l in log if re.search(r'Undefined symbols|symbol\(s\) not found|^ld: (?!warning)|referenced from|^\s+"?_[A-Za-z0-9_$.]+"?,? *$|duplicate symbol|make.*Error|\*\*\* ', l)][:300]
           emit('errors', errs[:360])
           emit('scripts', [l for l in log if re.search(r'Running script|Staged |requires xnu|refusing|fatal:|SystemExit|source changed', l)][:40])
+          emit('errlines', [l for l in log if re.search(r'(?i)\berror\b|failed|no such file|not found', l)
+                            and not re.search(r'built for newer|-Werror|error-limit|-Wno-error|warning:', l)][-80:])
+          import glob, os
+          emit('outputs', [f'{os.path.getsize(f):>12} {f}' for f in glob.glob('dxb/build/xnu.obj/*/kernel*') + glob.glob('dxb/fakeroot/System/Library/Kernels/*')])
           tail = [l for l in log if 'built for newer' not in l][-80:]
           emit('tail', tail)
           print('unique errors:', len(seen))
