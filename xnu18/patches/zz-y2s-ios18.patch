@@ -31661,7 +31661,7 @@ index d4e10cd..47572c2 100644
  
  /* I-Cache. */
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 77e126f..8bbc7e1 100644
+index 77e126f..2daaa72 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -32,6 +32,7 @@
@@ -31672,7 +31672,25 @@ index 77e126f..8bbc7e1 100644
  #include <arm/trap_internal.h> /* for IS_ARM_GDB_TRAP() et al */
  #include <arm64/proc_reg.h>
  #include <arm64/machine_machdep.h>
-@@ -2518,6 +2519,42 @@ sleh_irq(arm_saved_state_t *state)
+@@ -2099,6 +2100,17 @@ handle_kernel_abort(arm_saved_state_t *state, uint64_t esr, vm_offset_t fault_ad
+ 	(void)expected_fault_handler;
+ #endif /* CONFIG_XNUPOST */
+ 
++#if defined(ARM64_BOARD_CONFIG_Y2S)
++	/* Before the VM is up a kernel fault recurses through vm_fault until the
++	 * stack is gone; report the first one instead. */
++	{
++		if (kernel_map == VM_MAP_NULL) {
++			panic("Y2S early kernel abort: far 0x%lx esr 0x%llx pc 0x%llx lr 0x%llx",
++			    (unsigned long)fault_addr, esr, get_saved_state_pc(state), get_saved_state_lr(state));
++		}
++	}
++#endif
++
+ #if CONFIG_DTRACE
+ 	if (is_vm_fault(fault_code) && thread->t_dtrace_inprobe) { /* Executing under dtrace_probe? */
+ 		if (dtrace_tally_fault(fault_addr)) { /* Should a fault under dtrace be ignored? */
+@@ -2518,6 +2530,42 @@ sleh_irq(arm_saved_state_t *state)
  #endif
  
  
@@ -31715,7 +31733,7 @@ index 77e126f..8bbc7e1 100644
  	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
  
  #if USE_APPLEARMSMP
-@@ -2529,6 +2566,7 @@ sleh_irq(arm_saved_state_t *state)
+@@ -2529,6 +2577,7 @@ sleh_irq(arm_saved_state_t *state)
  	    cdp->interrupt_nub,
  	    cdp->interrupt_source);
  #endif
