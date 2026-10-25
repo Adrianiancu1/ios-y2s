@@ -126,6 +126,10 @@ def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = sys.argv[1]
+    global BUILD, VERSION
+    sv = load(os.path.join(root, 'System/Library/CoreServices/SystemVersion.plist'))
+    BUILD, VERSION = sv['ProductBuildVersion'], sv['ProductVersion']
+    print('root', VERSION, BUILD)
     launchd(root)
     containers(root)
     activation(root)
