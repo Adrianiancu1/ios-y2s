@@ -108,6 +108,23 @@ index 1c599f1..3660a52 100644
  bsd/kern/kern_csr.c			optional config_csr
  bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
+diff --git a/bsd/dev/arm/kern_machdep.c b/bsd/dev/arm/kern_machdep.c
+index 2d80677..fb4b70a 100644
+--- a/bsd/dev/arm/kern_machdep.c
++++ b/bsd/dev/arm/kern_machdep.c
+@@ -89,6 +89,12 @@ grade_binary(cpu_type_t exectype, cpu_subtype_t execsubtype, cpu_subtype_t execf
+ 				return 10;
+ 			case CPU_SUBTYPE_ARM64_ALL:
+ 				return 9;
++#if defined(ARM64_BOARD_CONFIG_Y2S)
++			/* arm64e code rewritten for v8.2 by tools/pac-strip.py; plain
++			 * slices win in fat files. */
++			case CPU_SUBTYPE_ARM64E:
++				return 8;
++#endif
+ 			}
+ 			break;
+ 
 diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
 index c64e636..0aa3808 100644
 --- a/bsd/dev/mem.c
@@ -31659,7 +31676,7 @@ index d4e10cd..47572c2 100644
  
  /* I-Cache. */
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 77e126f..4942e8a 100644
+index 77e126f..90c9fb1 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -32,6 +32,7 @@
@@ -31670,7 +31687,106 @@ index 77e126f..4942e8a 100644
  #include <arm/trap_internal.h> /* for IS_ARM_GDB_TRAP() et al */
  #include <arm64/proc_reg.h>
  #include <arm64/machine_machdep.h>
-@@ -2099,6 +2100,24 @@ handle_kernel_abort(arm_saved_state_t *state, uint64_t esr, vm_offset_t fault_ad
+@@ -1094,6 +1095,85 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
+  * Uncategorized exceptions are a catch-all for general execution errors.
+  * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
+  */
++
++#if defined(ARM64_BOARD_CONFIG_Y2S)
++/*
++ * ARMv8.3 instructions left in arm64e user code by tools/pac-strip.py
++ * (Cortex-A55 is v8.2): FJCVTZS and LDRAA/LDRAB with an offset no plain
++ * load can encode. Returns true if emulated (pc advanced).
++ */
++static bool
++y2s_emulate_v83(arm_saved_state_t *state, uint32_t instr)
++{
++	if ((instr & 0xfffffc00) == 0x1e7e0000) {        /* FJCVTZS Wd, Dn */
++		arm_neon_saved_state64_t *ns = neon_state64(current_thread()->machine.uNeon);
++		unsigned rn = (instr >> 5) & 31, rd = instr & 31;
++		uint64_t bits = (uint64_t)ns->v.q[rn];
++		bool sign = bits >> 63;
++		int exp = (int)((bits >> 52) & 0x7ff);
++		uint64_t mant = bits & ((1ULL << 52) - 1);
++		uint64_t mag = 0;
++		bool exact;
++		if (exp == 0x7ff) {
++			exact = false;
++		} else if (exp == 0) {
++			exact = (mant == 0) && !sign;
++		} else {
++			mant |= 1ULL << 52;
++			int sh = exp - 1075;
++			if (sh >= 0) {
++				mag = sh >= 64 ? 0 : mant << sh;
++				exact = sh <= 10 && (mant << sh) >> sh == mant;
++			} else if (sh > -64) {
++				mag = mant >> -sh;
++				exact = (mant & ((1ULL << -sh) - 1)) == 0;
++			} else {
++				exact = false;
++			}
++			if (exact && !(mag < (1ULL << 31) || (sign && mag == (1ULL << 31)))) {
++				exact = false;
++			}
++		}
++		uint32_t res = (uint32_t)(sign ? (0 - mag) : mag);
++		if (rd != 31) {
++			set_saved_state_reg(state, rd, res);
++		}
++		uint32_t cpsr = get_saved_state_cpsr(state) & ~0xf0000000u;
++		if (exact) {
++			cpsr |= 0x40000000u;                  /* Z */
++		}
++		set_saved_state_cpsr(state, cpsr);
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++	if ((instr & 0xff200400) == 0xf8200400) {        /* LDRAA/LDRAB Xt, [Xn, #imm]{!} */
++		unsigned rn = (instr >> 5) & 31, rt = instr & 31;
++		int imm = (int)(((instr >> 22) & 1) << 9 | ((instr >> 12) & 0x1ff));
++		if (imm & 0x200) {
++			imm -= 0x400;
++		}
++		uint64_t base = rn == 31 ? get_saved_state_sp(state) : get_saved_state_reg(state, rn);
++		uint64_t addr = base + (int64_t)imm * 8, val;
++		if (copyin(addr, &val, sizeof(val)) != 0) {
++			return false;
++		}
++		if (instr & (1u << 11)) {
++			if (rn == 31) {
++				set_saved_state_sp(state, addr);
++			} else {
++				set_saved_state_reg(state, rn, addr);
++			}
++		}
++		if (rt != 31) {
++			set_saved_state_reg(state, rt, val);
++		}
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++	return false;
++}
++#endif /* ARM64_BOARD_CONFIG_Y2S */
++
+ static void
+ handle_uncategorized(arm_saved_state_t *state)
+ {
+@@ -1104,6 +1184,12 @@ handle_uncategorized(arm_saved_state_t *state)
+ 
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 
++#if defined(ARM64_BOARD_CONFIG_Y2S)
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && y2s_emulate_v83(state, instr)) {
++		return;
++	}
++#endif
++
+ #if CONFIG_DTRACE
+ 
+ 	if (PSR64_IS_USER64(get_saved_state_cpsr(state))) {
+@@ -2099,6 +2185,24 @@ handle_kernel_abort(arm_saved_state_t *state, uint64_t esr, vm_offset_t fault_ad
  	(void)expected_fault_handler;
  #endif /* CONFIG_XNUPOST */
  
@@ -31695,7 +31811,7 @@ index 77e126f..4942e8a 100644
  #if CONFIG_DTRACE
  	if (is_vm_fault(fault_code) && thread->t_dtrace_inprobe) { /* Executing under dtrace_probe? */
  		if (dtrace_tally_fault(fault_addr)) { /* Should a fault under dtrace be ignored? */
-@@ -2518,6 +2537,42 @@ sleh_irq(arm_saved_state_t *state)
+@@ -2518,6 +2622,42 @@ sleh_irq(arm_saved_state_t *state)
  #endif
  
  
@@ -31738,7 +31854,7 @@ index 77e126f..4942e8a 100644
  	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
  
  #if USE_APPLEARMSMP
-@@ -2529,6 +2584,7 @@ sleh_irq(arm_saved_state_t *state)
+@@ -2529,6 +2669,7 @@ sleh_irq(arm_saved_state_t *state)
  	    cdp->interrupt_nub,
  	    cdp->interrupt_source);
  #endif

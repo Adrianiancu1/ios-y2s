@@ -2,6 +2,8 @@
 """Rewrite arm64e (ARMv8.3 pointer authentication) code for ARMv8.2 cores.
 
   pac-strip.py DIR_OR_FILES...      patch a dyld shared cache IN PLACE
+  pac-strip.py --macho ROOT_DIR     patch every arm64e Mach-O (thin or fat
+                                    slice) under ROOT_DIR IN PLACE
   pac-strip.py --selftest
 
 Takes the same inputs as pac-scan.py (main cache file + subcaches; work
@@ -24,6 +26,7 @@ count is printed.
 """
 import importlib.util
 import os
+import struct
 import sys
 
 import numpy as np
@@ -112,11 +115,96 @@ def selftest():
     return not bad
 
 
+def macho_text_ranges(fh, base):
+    """(file offset, size) of pure-instruction sections of an arm64e Mach-O at base."""
+    fh.seek(base)
+    mh = fh.read(32)
+    if len(mh) < 32:
+        return []
+    magic, ct, st, _ft, ncmds, sizeofcmds = struct.unpack_from("<IiiIII", mh, 0)
+    if magic != 0xfeedfacf or ct != 0x0100000c or (st & 0xff) != 2:
+        return []
+    cmds = fh.read(sizeofcmds)
+    out, q = [], 0
+    for _ in range(ncmds):
+        if q + 8 > len(cmds):
+            break
+        cmd, size = struct.unpack_from("<II", cmds, q)
+        if cmd == 0x19:
+            nsects = struct.unpack_from("<I", cmds, q + 64)[0]
+            for k in range(nsects):
+                sp = q + 72 + 80 * k
+                ssize = struct.unpack_from("<Q", cmds, sp + 40)[0]
+                soff = struct.unpack_from("<I", cmds, sp + 48)[0]
+                flags = struct.unpack_from("<I", cmds, sp + 64)[0]
+                if flags & 0x80000000 and ssize and soff:
+                    out.append((base + soff, ssize))
+        q += size
+    return out
+
+
+def macho_slices(path):
+    with open(path, "rb") as fh:
+        head = fh.read(8)
+        if len(head) < 8:
+            return []
+        magic = struct.unpack_from("<I", head)[0]
+        if magic == 0xfeedfacf:
+            return macho_text_ranges(fh, 0)
+        if struct.unpack_from(">I", head)[0] in (0xcafebabe, 0xcafebabf):
+            n = struct.unpack_from(">I", head, 4)[0]
+            big = struct.unpack_from(">I", head)[0] == 0xcafebabf
+            out = []
+            for i in range(min(n, 16)):
+                if big:
+                    fh.seek(8 + 32 * i)
+                    _ct, _st, off = struct.unpack(">iiQ", fh.read(16))
+                else:
+                    fh.seek(8 + 20 * i)
+                    _ct, _st, off = struct.unpack(">iiI", fh.read(12))
+                out += macho_text_ranges(fh, off)
+            return out
+    return []
+
+
+def macho_main(root):
+    total, left, nfiles = {}, {}, 0
+    for d, _dirs, names in os.walk(root):
+        for n in names:
+            path = os.path.join(d, n)
+            if os.path.islink(path) or not os.path.isfile(path) or n.startswith("dyld_shared_cache"):
+                continue
+            try:
+                ranges = macho_slices(path)
+            except OSError:
+                continue
+            if not ranges:
+                continue
+            mm = np.memmap(path, dtype="u1", mode="r+")
+            for foff, size in ranges:
+                w = mm[foff:foff + (size & ~3)].view("<u4")
+                c, l = rewrite(w)
+                for k, v in c.items():
+                    total[k] = total.get(k, 0) + v
+                for k, v in l.items():
+                    left[k] = left.get(k, 0) + v
+            mm.flush()
+            del mm
+            nfiles += 1
+    print(f"arm64e Mach-O files: {nfiles}")
+    for k, v in total.items():
+        print(f"{v:>10}  rewritten  {k}")
+    for k, v in left.items():
+        print(f"{v:>10}  left for kernel emulation  {k}")
+
+
 def main():
     if sys.argv[1:] == ["--selftest"]:
         sys.exit(0 if selftest() else 1)
     if not selftest():
         sys.exit("selftest failed, not touching anything")
+    if sys.argv[1:2] == ["--macho"] and len(sys.argv) == 3:
+        return macho_main(sys.argv[2])
     here = os.path.dirname(os.path.abspath(__file__))
     spec = importlib.util.spec_from_file_location("pacscan", os.path.join(here, "pac-scan.py"))
     scan = importlib.util.module_from_spec(spec)
