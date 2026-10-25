@@ -33079,7 +33079,7 @@ index 3ad743f..322c995 100644
  #else
  void
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index d0db827..20be117 100644
+index d0db827..73b3cf0 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
 @@ -26,6 +26,7 @@
@@ -33090,7 +33090,7 @@ index d0db827..20be117 100644
  #include <pexpert/arm/protos.h>
  #include <kern/sched_prim.h>
  #ifdef PL011_UART
-@@ -751,6 +752,161 @@ static void uart_puts_force_poll_device(
+@@ -751,6 +752,163 @@ static void uart_puts_force_poll_device(
  	const char *str,
  	struct pe_serial_functions *fns);
  
@@ -33142,7 +33142,7 @@ index d0db827..20be117 100644
 +fbcon_newline(void)
 +{
 +	fbcon_col = 0;
-+	fbcon_row = (fbcon_row + 1) % fbcon_rows;
++	fbcon_row = fbcon_rows ? (fbcon_row + 1) % fbcon_rows : 0;
 +	fbcon_clear_row(fbcon_row);
 +	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
 +}
@@ -33245,6 +33245,8 @@ index d0db827..20be117 100644
 +	fbcon_map_size = reg[1];
 +	y2s_early_mark(18, "fbcon mapping returned");
 +	if (fbcon_base != NULL) {
++		/* 11417's serial_init no longer calls .init for us */
++		fbcon_init();
 +		register_serial_functions(&y2s_fbcon_serial_functions);
 +	}
 +}
@@ -33252,7 +33254,7 @@ index d0db827..20be117 100644
  #if HIBERNATION
  /**
   * Transitions the serial driver into a mode that can be run in the hibernation
-@@ -908,11 +1064,14 @@ serial_init(void)
+@@ -908,11 +1066,14 @@ serial_init(void)
  
  	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
  
