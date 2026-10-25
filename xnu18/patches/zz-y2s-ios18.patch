@@ -4722,10 +4722,10 @@ index a719915..622b0a8 100644
  435     AUE_NULL        ALL     { int nosys(void); }
 diff --git a/bsd/kern/y2s_amfi.c b/bsd/kern/y2s_amfi.c
 new file mode 100644
-index 0000000..d15b02b
+index 0000000..0546b02
 --- /dev/null
 +++ b/bsd/kern/y2s_amfi.c
-@@ -0,0 +1,383 @@
+@@ -0,0 +1,385 @@
 +/*
 + * Built-in AMFI interface for Y2S.
 + *
@@ -5026,8 +5026,10 @@ index 0000000..d15b02b
 +	case 4:         /* container path (audit token / pid) */
 +	case 5:         /* extension issue */
 +	case 6:         /* extension consume */
-+	case 0x43:      /* container expected */
 +		return ENOENT;
++	case 0x43:      /* container expected: success, caller-zeroed outputs = none
++	                 * (iOS 18 _container_init aborts on failure) */
++		return 0;
 +	default:
 +		return 0;
 +	}
