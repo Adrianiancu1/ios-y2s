@@ -6315,10 +6315,10 @@ index 0000000..cb24237
 +#endif /* ARM64_BOARD_CONFIG_Y2S */
 diff --git a/iokit/Kernel/arm/Y2SCPU.cpp b/iokit/Kernel/arm/Y2SCPU.cpp
 new file mode 100644
-index 0000000..b1d0914
+index 0000000..44c0d91
 --- /dev/null
 +++ b/iokit/Kernel/arm/Y2SCPU.cpp
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,269 @@
 +/*
 + * A55 SMP bring-up for y2s using XNU's legacy IOCPU interface and PSCI.
 + * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
@@ -6482,11 +6482,9 @@ index 0000000..b1d0914
 +	}
 +	for (unsigned int i = 0; i < topology->num_cpus; i++) {
 +		Y2SCPU *cpu = __atomic_load_n(&y2s_cpus[i], __ATOMIC_ACQUIRE);
-+		kern_return_t kr = processor_start(cpu->machProcessor);
-+		if (kr != KERN_SUCCESS) {
-+			panic("Y2S CPU: cpu=%u processor_start failed: %d", i, kr);
-+		}
-+		/* processor_start() is asynchronous for secondaries in this XNU. */
++		/* xnu-11417: ml_processor_register() boots the CPU itself and the
++		 * kext processor_start() KPI is a no-op returning KERN_FAILURE. */
++		(void)cpu->machProcessor;
 +		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
 +		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 +		    !y2s_cpu_signal_is_enabled(i)) {
